@@ -357,9 +357,15 @@ def init_state():
         "show_data": False,
         "masked_cols": [],
         "quick_question": None,
-        "quick_chart": None,
         "switch_to_chat": False,
         "active_page": "💬 Chat",
+        # Phase 2: chart theme
+        "chart_theme": "Default",
+        # Phase 3: scroll flag
+        "_just_jumped": False,
+        # Phase 1: AI chart cache
+        "ai_charts_suggestions": None,
+        "ai_charts_cache_key": "",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -379,6 +385,22 @@ if not st.session_state.api_key and _STARTUP_KEYS.get(st.session_state.provider)
 
 
 # ─────────────────────────────────────────────
+
+# ─────────────────────────────────────────────
+# PHASE 2: Chart Theme Customization
+# ─────────────────────────────────────────────
+CHART_THEMES = {
+    "Default":  {"template": "plotly_white",  "colors": px.colors.qualitative.Set2},
+    "Ocean":    {"template": "plotly_white",  "colors": ["#0077b6","#00b4d8","#90e0ef","#0096c7","#48cae4","#023e8a","#ade8f4"]},
+    "Warm":     {"template": "plotly_white",  "colors": ["#e63946","#f4a261","#e9c46a","#2a9d8f","#e76f51","#264653","#a8dadc"]},
+    "Minimal":  {"template": "simple_white",  "colors": ["#555555","#888888","#aaaaaa","#333333","#666666","#999999","#bbbbbb"]},
+    "Dark":     {"template": "plotly_dark",   "colors": ["#636efa","#ef553b","#00cc96","#ab63fa","#ffa15a","#19d3f3","#ff6692"]},
+}
+
+def get_theme():
+    t = st.session_state.get("chart_theme", "Default")
+    return CHART_THEMES.get(t, CHART_THEMES["Default"])
+
 # Data Profiling
 # ─────────────────────────────────────────────
 def profile_dataframe(df: pd.DataFrame) -> dict:
@@ -577,6 +599,49 @@ def apply_masking(df: pd.DataFrame, masked_cols: list) -> pd.DataFrame:
 
     return df_masked
 
+
+
+
+# ─────────────────────────────────────────────
+# Multi-file loader helper
+# ─────────────────────────────────────────────
+def load_files(file_list: list, masked_cols: list):
+    """
+    Read one or more uploaded files and return (df_raw, df, file_label, errors).
+    Multiple files are concatenated column-union style (outer join so no data is lost).
+    Mixed CSV / Excel is supported.
+    """
+    dfs = []
+    names = []
+    errors = []
+
+    for f in file_list:
+        try:
+            if f.name.lower().endswith(".csv"):
+                _d = pd.read_csv(f)
+            else:
+                _d = pd.read_excel(f)
+            dfs.append(_d)
+            names.append(f.name)
+        except Exception as e:
+            errors.append(f"❌ {f.name}: {e}")
+
+    if not dfs:
+        return None, None, "", errors
+
+    if len(dfs) == 1:
+        df_raw = dfs[0]
+        label  = names[0]
+    else:
+        # Add a source column so the user can filter by file later
+        for i, (d, n) in enumerate(zip(dfs, names)):
+            d["_source_file"] = n
+        # Outer join — keeps all columns, fills missing with NaN
+        df_raw = pd.concat(dfs, ignore_index=True, sort=False)
+        label  = f"{len(dfs)} files merged ({', '.join(names)})"
+
+    df = apply_masking(df_raw, masked_cols)
+    return df_raw, df, label, errors
 
 
 def build_context(df: pd.DataFrame, profile: dict) -> str:
@@ -999,350 +1064,6 @@ def generate_chart(question: str, df: pd.DataFrame, chart_type: str):
     except Exception as e:
         return None
 
-
-# ─────────────────────────────────────────────
-# Fleet-Aware Chart Generator
-# Maps each quick-question key to the right chart
-# ─────────────────────────────────────────────
-
-def generate_fleet_chart(chart_key: str, df: pd.DataFrame, cols: dict, hf_df: pd.DataFrame):
-    """
-    Generate a Plotly figure tailored to a specific fleet quick-question.
-    chart_key matches the keys defined in QUICK_CHART_MAP below.
-    Returns a list of figures (can be 1 or more), or [] on failure.
-    """
-    TEMPLATE = "plotly_white"
-    GREEN  = "#22c55e"
-    RED    = "#ef4444"
-    BLUE   = "#3b82f6"
-    AMBER  = "#f59e0b"
-    COLORS = ["#3b82f6","#22c55e","#f59e0b","#ef4444","#8b5cf6","#ec4899","#14b8a6","#f97316"]
-
-    hf          = cols.get("hotfix_cols", [])
-    status_col  = cols.get("status_col")
-    cs_col      = cols.get("common_status_col")
-    vessel_col  = cols.get("vessel_col")
-    delay_col   = cols.get("delay_col")
-
-    figs = []
-
-    try:
-        # ── Deployment / hotfix charts ───────────────────────────────
-        if chart_key in ("hotfix_installed_count", "deployment_trend",
-                         "overall_success_rate", "hotfix_highest_success",
-                         "hotfix_most_offline", "hotfix8_adoption"):
-            if hf_df.empty:
-                return []
-            fig = go.Figure()
-            fig.add_bar(x=hf_df["Label"], y=hf_df["Installed"],
-                        name="Installed", marker_color=GREEN)
-            fig.add_bar(x=hf_df["Label"], y=hf_df["Offline"],
-                        name="Offline", marker_color=RED)
-            fig.add_scatter(x=hf_df["Label"], y=hf_df["Success %"],
-                            mode="lines+markers", name="Success %",
-                            yaxis="y2", line=dict(color=BLUE, width=2.5),
-                            marker=dict(size=8))
-            fig.update_layout(
-                barmode="stack", template=TEMPLATE,
-                title="Deployment Success per Hotfix",
-                yaxis=dict(title="Vessel Count"),
-                yaxis2=dict(overlaying="y", side="right", title="Success %",
-                            range=[max(0, hf_df["Success %"].min()-5), 105]),
-                xaxis_tickangle=-30,
-            )
-            figs.append(fig)
-
-            # For adoption specifically: also add a line chart
-            if chart_key in ("hotfix8_adoption", "deployment_trend"):
-                fig2 = px.line(hf_df, x="Label", y="Success %",
-                               markers=True, template=TEMPLATE,
-                               title="Adoption Rate Trend Across Hotfixes",
-                               color_discrete_sequence=[BLUE])
-                fig2.update_traces(line_width=3, marker_size=9)
-                fig2.add_hline(y=hf_df["Success %"].mean(), line_dash="dash",
-                               line_color=AMBER,
-                               annotation_text=f"Fleet avg {hf_df['Success %'].mean():.1f}%")
-                figs.append(fig2)
-
-        # ── Delay charts ─────────────────────────────────────────────
-        elif chart_key in ("avg_deployment_delay", "hotfix_highest_delay"):
-            if hf_df.empty or "Avg Delay (d)" not in hf_df.columns:
-                return []
-            delay_data = hf_df.dropna(subset=["Avg Delay (d)"])
-            if delay_data.empty:
-                return []
-            fig = px.bar(delay_data, x="Label", y="Avg Delay (d)",
-                         color="Avg Delay (d)", color_continuous_scale="RdYlGn_r",
-                         template=TEMPLATE, text_auto=True,
-                         title="Average Deployment Delay per Hotfix (days)")
-            fig.update_xaxes(tickangle=-30)
-            figs.append(fig)
-
-        elif chart_key == "vessels_longest_delay":
-            # Per-vessel: count how many hotfixes where delay > 0
-            if not hf or vessel_col is None:
-                return []
-            rows = []
-            for col_name, planned, label in hf:
-                for _, row in df.iterrows():
-                    val = row[col_name]
-                    if _is_installed(val):
-                        try:
-                            d = (pd.to_datetime(val) - planned).days
-                            if d > 0:
-                                rows.append({"Vessel": str(row[vessel_col]), "Delay": d, "Hotfix": label})
-                        except Exception:
-                            pass
-            if not rows:
-                return []
-            delay_df = pd.DataFrame(rows)
-            top_df = (delay_df.groupby("Vessel")["Delay"].sum()
-                      .reset_index().nlargest(15, "Delay"))
-            fig = px.bar(top_df, x="Delay", y="Vessel", orientation="h",
-                         color="Delay", color_continuous_scale="Reds",
-                         template=TEMPLATE, text_auto=True,
-                         title="Top 15 Vessels — Total Cumulative Delay (days)")
-            fig.update_layout(yaxis=dict(autorange="reversed"))
-            figs.append(fig)
-
-        elif chart_key == "vessels_consistently_late":
-            if not hf or vessel_col is None:
-                return []
-            late_counts = {}
-            for col_name, planned, label in hf:
-                for _, row in df.iterrows():
-                    v = str(row[vessel_col])
-                    val = row[col_name]
-                    if _is_installed(val):
-                        try:
-                            d = (pd.to_datetime(val) - planned).days
-                            if d > 0:
-                                late_counts[v] = late_counts.get(v, 0) + 1
-                        except Exception:
-                            pass
-            if not late_counts:
-                return []
-            late_df = (pd.DataFrame(list(late_counts.items()), columns=["Vessel", "Late Count"])
-                       .nlargest(15, "Late Count"))
-            fig = px.bar(late_df, x="Late Count", y="Vessel", orientation="h",
-                         color="Late Count", color_continuous_scale="Oranges",
-                         template=TEMPLATE, text_auto=True,
-                         title="Top 15 Vessels — Number of Hotfixes Installed Late")
-            fig.update_layout(yaxis=dict(autorange="reversed"))
-            figs.append(fig)
-
-        elif chart_key == "vessels_installed_on_release_date":
-            if not hf or vessel_col is None:
-                return []
-            counts = {"On Time": 0, "Late": 0, "Offline/Missing": 0}
-            last_col, last_planned, last_label = hf[-1]
-            for val in df[last_col]:
-                if _is_installed(val):
-                    try:
-                        d = (pd.to_datetime(val) - last_planned).days
-                        if d <= 0:
-                            counts["On Time"] += 1
-                        else:
-                            counts["Late"] += 1
-                    except Exception:
-                        counts["Offline/Missing"] += 1
-                else:
-                    counts["Offline/Missing"] += 1
-            pie_df = pd.DataFrame(list(counts.items()), columns=["Category", "Count"])
-            fig = px.pie(pie_df, names="Category", values="Count",
-                         title=f"{last_label} — On Time vs Late vs Missing",
-                         color_discrete_sequence=[GREEN, AMBER, RED],
-                         hole=0.4, template=TEMPLATE)
-            figs.append(fig)
-
-        # ── Status / compliance charts ───────────────────────────────
-        elif chart_key in ("live_vs_other", "not_live_vessels"):
-            if status_col and status_col in df.columns:
-                sc = df[status_col].fillna("(blank)").value_counts().reset_index()
-                sc.columns = ["Status", "Count"]
-                sc["% of Fleet"] = (sc["Count"] / len(df) * 100).round(1)
-                fig = px.bar(sc, x="Status", y="Count", color="Status",
-                             color_discrete_sequence=COLORS,
-                             text="% of Fleet", template=TEMPLATE,
-                             title="Vessel Status Breakdown")
-                fig.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
-                fig.update_xaxes(tickangle=-30)
-                figs.append(fig)
-                fig2 = px.pie(sc, names="Status", values="Count",
-                              title="Status Distribution (Pie)",
-                              color_discrete_sequence=COLORS,
-                              hole=0.35, template=TEMPLATE)
-                figs.append(fig2)
-
-        elif chart_key in ("fleet_compliance", "fully_compliant_pct"):
-            if not hf:
-                return []
-            compliant    = int(df.apply(lambda r: all(_is_installed(r[c]) for c, _, __ in hf), axis=1).sum())
-            non_compliant = len(df) - compliant
-            pie_df = pd.DataFrame({"Category": ["Fully Compliant", "Non-Compliant"],
-                                   "Count": [compliant, non_compliant]})
-            fig = px.pie(pie_df, names="Category", values="Count",
-                         color_discrete_sequence=[GREEN, RED],
-                         hole=0.45, template=TEMPLATE,
-                         title=f"Fleet Compliance — {round(compliant/len(df)*100,1)}% Fully Compliant")
-            figs.append(fig)
-            # Also: per-hotfix compliance bars
-            if not hf_df.empty:
-                fig2 = px.bar(hf_df, x="Label", y="Success %",
-                              color="Success %", color_continuous_scale="RdYlGn",
-                              text_auto=True, template=TEMPLATE,
-                              title="Success Rate per Hotfix (%)")
-                fig2.update_xaxes(tickangle=-30)
-                figs.append(fig2)
-
-        elif chart_key in ("vessels_missed_most", "top10_noncompliant"):
-            if not hf or vessel_col is None:
-                return []
-            missed = df.apply(
-                lambda r: sum(1 for c, _, __ in hf if not _is_installed(r[c])), axis=1)
-            miss_df = df[[vessel_col]].copy()
-            miss_df["Missed Updates"] = missed.values
-            top_miss = miss_df.nlargest(15, "Missed Updates")
-            fig = px.bar(top_miss, x="Missed Updates", y=vessel_col,
-                         orientation="h", color="Missed Updates",
-                         color_continuous_scale="Reds", text_auto=True,
-                         template=TEMPLATE,
-                         title="Top 15 Non-Compliant Vessels — Missed Hotfix Updates")
-            fig.update_layout(yaxis=dict(autorange="reversed"))
-            figs.append(fig)
-
-        elif chart_key == "vessels_offline_multiple":
-            if not hf or vessel_col is None:
-                return []
-            offline_counts = df.apply(
-                lambda r: sum(1 for c, _, __ in hf if _is_offline(r[c])), axis=1)
-            off_df = df[[vessel_col]].copy()
-            off_df["Offline Count"] = offline_counts.values
-            off_df = off_df[off_df["Offline Count"] > 1].nlargest(15, "Offline Count")
-            if off_df.empty:
-                return []
-            fig = px.bar(off_df, x="Offline Count", y=vessel_col,
-                         orientation="h", color="Offline Count",
-                         color_continuous_scale="OrRd", text_auto=True,
-                         template=TEMPLATE,
-                         title="Vessels Offline Across Multiple Hotfixes")
-            fig.update_layout(yaxis=dict(autorange="reversed"))
-            figs.append(fig)
-
-        elif chart_key in ("vessels_missing_hotfix8", "vessels_missing_hotfix7",
-                           "vessels_all_hotfixes", "compare_hf7_hf8"):
-            if hf_df.empty:
-                return []
-            # Show adoption bar for relevant hotfixes
-            relevant = hf_df.copy()
-            if "hotfix8" in chart_key:
-                relevant = hf_df[hf_df["Label"].str.contains("8", na=False)]
-            elif "hotfix7" in chart_key:
-                relevant = hf_df[hf_df["Label"].str.contains("7|8", na=False)]
-            elif "compare" in chart_key:
-                relevant = hf_df[hf_df["Label"].str.contains("7|8", na=False)]
-            if relevant.empty:
-                relevant = hf_df
-
-            fig = go.Figure()
-            fig.add_bar(x=relevant["Label"], y=relevant["Installed"],
-                        name="Installed", marker_color=GREEN, text=relevant["Installed"],
-                        textposition="outside")
-            fig.add_bar(x=relevant["Label"], y=relevant["Offline"],
-                        name="Offline", marker_color=RED, text=relevant["Offline"],
-                        textposition="outside")
-            fig.update_layout(barmode="group", template=TEMPLATE,
-                              title="Installed vs Offline — Hotfix Comparison")
-            figs.append(fig)
-
-        # ── Common status charts ─────────────────────────────────────
-        elif chart_key in ("most_common_statuses", "status_distribution",
-                           "aot_count", "vessel_sold_count", "no_status_vessels"):
-            target_col = cs_col or status_col
-            if target_col and target_col in df.columns:
-                vc = df[target_col].fillna("(no status)").value_counts().reset_index()
-                vc.columns = ["Status", "Count"]
-                vc["% of Fleet"] = (vc["Count"] / len(df) * 100).round(1)
-                fig = px.bar(vc.head(20), x="Status", y="Count",
-                             color="Count", color_continuous_scale="Blues",
-                             text="% of Fleet", template=TEMPLATE,
-                             title=f"Common Status Distribution — {target_col}")
-                fig.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
-                fig.update_xaxes(tickangle=-35)
-                figs.append(fig)
-                fig2 = px.pie(vc.head(12), names="Status", values="Count",
-                              title="Status Distribution (Pie)",
-                              color_discrete_sequence=COLORS,
-                              hole=0.35, template=TEMPLATE)
-                figs.append(fig2)
-
-        # ── KPI summary chart ────────────────────────────────────────
-        elif chart_key in ("offline_rate_latest_hotfix", "avg_delay_kpi"):
-            if hf_df.empty:
-                return []
-            fig = px.bar(hf_df, x="Label", y=["Installed", "Offline"],
-                         barmode="group", template=TEMPLATE,
-                         color_discrete_sequence=[GREEN, RED],
-                         title="Installed vs Offline per Hotfix")
-            fig.update_xaxes(tickangle=-30)
-            figs.append(fig)
-
-    except Exception as e:
-        return []
-
-    # Apply consistent layout to all figures
-    for fig in figs:
-        fig.update_layout(
-            margin=dict(t=50, b=35, l=30, r=30),
-            height=400,
-            font=dict(family="DM Sans, sans-serif", size=12),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02,
-                        xanchor="right", x=1),
-        )
-    return figs
-
-
-# Map from quick question label → chart_key used above
-QUICK_CHART_MAP = {
-    # Deployment & Upgrade
-    "How many vessels installed each hotfix?":          "hotfix_installed_count",
-    "Latest hotfix adoption %":                         "hotfix8_adoption",
-    "Hotfix with highest success rate":                 "hotfix_highest_success",
-    "Hotfix with most offline vessels":                 "hotfix_most_offline",
-    "Deployment trend across all hotfixes":             "deployment_trend",
-    # Vessel Status
-    "Live vs other statuses count":                     "live_vs_other",
-    "Vessels offline for multiple hotfixes":            "vessels_offline_multiple",
-    "Fully compliant vessels %":                        "fully_compliant_pct",
-    "Vessels that missed the most updates":             "vessels_missed_most",
-    "Vessels not Live (sold, AOT, etc.)":               "not_live_vessels",
-    # Delay Analysis
-    "Average deployment delay":                         "avg_deployment_delay",
-    "Vessels with longest install delay":               "vessels_longest_delay",
-    "Hotfix with highest average delay":                "hotfix_highest_delay",
-    "Vessels installed on release date":                "vessels_installed_on_release_date",
-    "Vessels consistently late":                        "vessels_consistently_late",
-    # Common Status
-    "Most common vessel statuses":                      "most_common_statuses",
-    "AOT Configuration count":                          "aot_count",
-    "Vessel sold count":                                "vessel_sold_count",
-    "Vessels with no status":                           "no_status_vessels",
-    "Status distribution %":                            "status_distribution",
-    # KPI Metrics
-    "Fleet compliance rate":                            "fleet_compliance",
-    "Overall update success rate":                      "overall_success_rate",
-    "Offline rate for latest hotfix":                   "offline_rate_latest_hotfix",
-    "Average deployment delay in days":                 "avg_delay_kpi",
-    "Hotfix 8 adoption rate":                           "hotfix8_adoption",
-    # Vessel Lookup
-    "Vessels missing Hotfix 8":                         "vessels_missing_hotfix8",
-    "Vessels missing Hotfix 7":                         "vessels_missing_hotfix7",
-    "Vessels with all hotfixes installed":              "vessels_all_hotfixes",
-    "Compare Hotfix 7 vs Hotfix 8 adoption":           "compare_hf7_hf8",
-    "Top 10 non-compliant vessels":                     "top10_noncompliant",
-}
-
-
 # ─────────────────────────────────────────────
 # Gemini API Call
 # ─────────────────────────────────────────────
@@ -1558,6 +1279,269 @@ def call_ai_streaming(messages: list, context: str):
             yield f"❌ Error: {err}"
 
 
+
+# ─────────────────────────────────────────────
+# PHASE 1: AI Auto-Suggest Charts
+# ─────────────────────────────────────────────
+import json as _json_ac
+
+def ai_suggest_charts(df: pd.DataFrame, profile: dict) -> list:
+    """
+    Calls the active AI provider and asks it to recommend 5 charts
+    for this dataset. Returns a list of chart config dicts.
+    Each dict has: type, x, y, title, insight, color_by (optional)
+    """
+    cols = list(df.columns)
+    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    cat_cols = df.select_dtypes(exclude=[np.number]).columns.tolist()
+
+    col_summary = []
+    for col in cols[:25]:
+        p = profile[col]
+        if p["is_numeric"]:
+            col_summary.append(f"{col} [numeric, range {p['min']}–{p['max']}]")
+        else:
+            top = list(p["top_values"].keys())[:3]
+            col_summary.append(f"{col} [text, {p['unique']} unique, top: {top}]")
+
+    sample_rows = df.head(3).astype(str).to_dict(orient="records")
+
+    prompt = f"""You are a data visualization expert. Given this dataset schema, suggest exactly 5 chart configs.
+
+Dataset: {st.session_state.file_name}
+Rows: {len(df):,}
+Columns: {', '.join(cols[:25])}
+
+Column details:
+{chr(10).join(col_summary)}
+
+Sample data (3 rows):
+{_json_ac.dumps(sample_rows, default=str)[:1500]}
+
+Respond ONLY with a valid JSON array. No markdown, no explanation, no code fences. Just the raw JSON array.
+
+Each element must have exactly these keys:
+- "type": one of bar, line, scatter, pie, histogram, box, heatmap, area
+- "x": column name for X axis (must exist in columns above)  
+- "y": column name for Y axis (must exist in columns above, must be numeric for most types), or null for histogram/pie
+- "title": short chart title string
+- "insight": one sentence describing what this chart will reveal
+- "color_by": a categorical column name to color by, or null
+
+Return only charts that make sense for the actual data. Use the most insightful combinations.
+"""
+
+    api_key = st.session_state.api_key
+    provider = st.session_state.provider
+    model = st.session_state.model
+
+    if not api_key:
+        return []
+
+    raw_text = ""
+    try:
+        if provider == "Groq (Free)":
+            if not GROQ_OK:
+                return []
+            client = Groq(api_key=api_key)
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=800,
+                temperature=0.2,
+            )
+            raw_text = resp.choices[0].message.content or ""
+
+        elif provider == "Gemini (Free)":
+            if not GEMINI_OK:
+                return []
+            import google.generativeai as _genai
+            _genai.configure(api_key=api_key)
+            gm = _genai.GenerativeModel(
+                model_name=model,
+                generation_config=_genai.types.GenerationConfig(max_output_tokens=800, temperature=0.2),
+            )
+            resp = gm.generate_content(prompt)
+            raw_text = resp.text or ""
+
+        elif provider == "Mistral (Free)":
+            import requests as _req
+            resp = _req.post(
+                "https://api.mistral.ai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"model": model, "messages": [{"role": "user", "content": prompt}],
+                      "max_tokens": 800, "temperature": 0.2},
+                timeout=30,
+            )
+            if resp.status_code == 200:
+                raw_text = resp.json()["choices"][0]["message"]["content"] or ""
+
+        elif provider == "Cohere (Free)":
+            if not COHERE_OK:
+                return []
+            co = cohere.ClientV2(api_key=api_key)
+            resp = co.chat(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=800,
+            )
+            raw_text = resp.message.content[0].text or ""
+
+        # Strip markdown code fences if present
+        raw_text = raw_text.strip()
+        if raw_text.startswith("```"):
+            raw_text = raw_text.split("```")[1]
+            if raw_text.startswith("json"):
+                raw_text = raw_text[4:]
+        raw_text = raw_text.strip().strip("`").strip()
+
+        suggestions = _json_ac.loads(raw_text)
+        if isinstance(suggestions, list):
+            # Validate each suggestion has required keys and columns exist
+            valid = []
+            for s in suggestions:
+                if not isinstance(s, dict):
+                    continue
+                if "type" not in s or "title" not in s:
+                    continue
+                x_ok = s.get("x") is None or s.get("x") in df.columns
+                y_ok = s.get("y") is None or s.get("y") in df.columns
+                if x_ok and y_ok:
+                    valid.append(s)
+            return valid[:5]
+        return []
+
+    except Exception:
+        return []
+
+
+@st.cache_data(show_spinner=False)
+def ai_suggest_charts_cached(file_name: str, col_signature: str, provider: str, model: str) -> list:
+    """
+    Wrapper with cache key based on file + columns + provider/model.
+    We pass df and profile through session state inside this call.
+    """
+    df = st.session_state.df
+    profile = st.session_state.profile
+    if df is None or profile is None:
+        return []
+    return ai_suggest_charts(df, profile)
+
+
+def render_ai_chart(cfg: dict, df: pd.DataFrame, chart_idx: int):
+    """Render a single AI-suggested chart from its config dict."""
+    chart_type = cfg.get("type", "bar")
+    x = cfg.get("x")
+    y = cfg.get("y")
+    title = cfg.get("title", "Chart")
+    insight = cfg.get("insight", "")
+    color_by = cfg.get("color_by")
+
+    theme = get_theme()
+    tpl = theme["template"]
+    colors = theme["colors"]
+
+    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    cat_cols = df.select_dtypes(exclude=[np.number]).columns.tolist()
+
+    # Validate color_by
+    if color_by and color_by not in df.columns:
+        color_by = None
+
+    try:
+        fig = None
+
+        if chart_type == "bar":
+            if x and y and y in df.columns and x in df.columns:
+                if pd.api.types.is_numeric_dtype(df[y]):
+                    grp = (df.groupby(df[x].fillna("(blank)").astype(str))[y]
+                           .sum().sort_values(ascending=False).head(20).reset_index())
+                    grp.columns = [x, y]
+                    fig = px.bar(grp, x=x, y=y, color=x if not color_by else None,
+                                 title=title, template=tpl,
+                                 color_discrete_sequence=colors, text_auto=True)
+                    fig.update_xaxes(tickangle=-35)
+            elif x and x in df.columns:
+                vc = df[x].fillna("(blank)").astype(str).value_counts().head(20).reset_index()
+                vc.columns = [x, "Count"]
+                fig = px.bar(vc, x=x, y="Count", title=title, template=tpl,
+                             color_discrete_sequence=colors, text_auto=True)
+                fig.update_xaxes(tickangle=-35)
+
+        elif chart_type == "line":
+            if x and y and x in df.columns and y in df.columns:
+                plot_df = df[[x, y] + ([color_by] if color_by else [])].dropna().sort_values(x)
+                fig = px.line(plot_df, x=x, y=y, color=color_by, title=title,
+                              template=tpl, color_discrete_sequence=colors)
+
+        elif chart_type == "scatter":
+            if x and y and x in df.columns and y in df.columns:
+                plot_df = df[[x, y] + ([color_by] if color_by else [])].dropna().sample(min(2000, len(df)))
+                fig = px.scatter(plot_df, x=x, y=y, color=color_by, title=title,
+                                 template=tpl, color_discrete_sequence=colors, opacity=0.7)
+
+        elif chart_type == "histogram":
+            col = x or (num_cols[0] if num_cols else None)
+            if col and col in df.columns:
+                fig = px.histogram(df, x=col, color=color_by, title=title,
+                                   template=tpl, color_discrete_sequence=colors,
+                                   nbins=40, marginal="rug")
+
+        elif chart_type == "box":
+            col = y or (num_cols[0] if num_cols else None)
+            if col and col in df.columns:
+                fig = px.box(df, x=x if x and x in cat_cols else None, y=col,
+                             color=color_by or (x if x and x in cat_cols else None),
+                             title=title, template=tpl, color_discrete_sequence=colors,
+                             points="outliers")
+
+        elif chart_type == "pie":
+            col = x or (cat_cols[0] if cat_cols else None)
+            if col and col in df.columns:
+                vc = df[col].fillna("(blank)").astype(str).value_counts().head(12).reset_index()
+                vc.columns = [col, "Count"]
+                fig = px.pie(vc, names=col, values="Count", title=title,
+                             template=tpl, color_discrete_sequence=colors, hole=0.35)
+
+        elif chart_type == "heatmap":
+            if len(num_cols) >= 2:
+                corr = df[num_cols[:12]].corr().round(2)
+                fig = go.Figure(go.Heatmap(
+                    z=corr.values, x=corr.columns.tolist(), y=corr.columns.tolist(),
+                    colorscale="RdBu", zmid=0,
+                    text=corr.values.round(2), texttemplate="%{text}",
+                    textfont={"size": 10},
+                ))
+                fig.update_layout(title=title, template=tpl,
+                                  height=max(350, len(num_cols[:12]) * 45))
+
+        elif chart_type == "area":
+            if x and y and x in df.columns and y in df.columns:
+                plot_df = df[[x, y] + ([color_by] if color_by else [])].dropna().sort_values(x)
+                fig = px.area(plot_df, x=x, y=y, color=color_by, title=title,
+                              template=tpl, color_discrete_sequence=colors)
+
+        if fig is None:
+            # Fallback: best-effort bar from top categorical column
+            if cat_cols:
+                vc = df[cat_cols[0]].fillna("(blank)").astype(str).value_counts().head(15).reset_index()
+                vc.columns = [cat_cols[0], "Count"]
+                fig = px.bar(vc, x=cat_cols[0], y="Count", title=title,
+                             template=tpl, color_discrete_sequence=colors)
+
+        if fig:
+            fig.update_layout(
+                margin=dict(t=50, b=30, l=25, r=25), height=380,
+                font=dict(family="DM Sans, sans-serif", size=12),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            )
+            st.plotly_chart(fig, use_container_width=True, key=f"ai_chart_{chart_idx}")
+            if insight:
+                st.caption(f"💡 {insight}")
+
+    except Exception as e:
+        st.warning(f"Could not render chart: {e}")
+
 # ─────────────────────────────────────────────
 # Sidebar
 # ─────────────────────────────────────────────
@@ -1613,39 +1597,51 @@ with st.sidebar:
     st.markdown("### 📁 File Upload")
 
     uploaded = st.file_uploader(
-        "Upload dataset",
+        "Upload dataset(s)",
         type=["xlsx", "xls", "csv"],
-        help="Excel or CSV files"
+        accept_multiple_files=True,
+        help="Upload one or more Excel / CSV files. Multiple files are merged automatically.",
     )
 
     if uploaded:
-        try:
-            if uploaded.name.endswith(".csv"):
-                _sb_df_raw = pd.read_csv(uploaded)
-            else:
-                _sb_df_raw = pd.read_excel(uploaded)
+        _sb_df_raw, _sb_df_loaded, _sb_label, _sb_errors = load_files(
+            uploaded, st.session_state.masked_cols
+        )
+        for err in _sb_errors:
+            st.error(err)
 
-            st.session_state.df_raw   = _sb_df_raw
-            st.session_state.file_name = uploaded.name
-            _sb_df_loaded = apply_masking(_sb_df_raw, st.session_state.masked_cols)
-            st.session_state.df      = _sb_df_loaded
-            st.session_state.profile = profile_dataframe(_sb_df_loaded)
+        if _sb_df_raw is not None:
+            _changed = (st.session_state.file_name != _sb_label)
+            st.session_state.df_raw    = _sb_df_raw
+            st.session_state.file_name = _sb_label
+            st.session_state.df        = _sb_df_loaded
+            st.session_state.profile   = profile_dataframe(_sb_df_loaded)
 
-            if not st.session_state.messages:
+            if _changed or not st.session_state.messages:
+                n_files = len(uploaded)
+                if n_files == 1:
+                    _intro = f"✅ **{uploaded[0].name}** loaded!\n\n"
+                else:
+                    _intro = f"✅ **{n_files} files merged** into one dataset!\n\n"
+                    _intro += "\n".join(f"  - {f.name}" for f in uploaded) + "\n\n"
                 st.session_state.messages = [{
                     "role": "assistant",
                     "content": (
-                        f"✅ **{uploaded.name}** loaded successfully!\n\n"
-                        f"- **{len(_sb_df_raw):,} rows** × **{len(_sb_df_raw.columns)} columns**\n"
-                        f"- Columns: {', '.join(_sb_df_raw.columns.tolist()[:8])}"
-                        f"{'...' if len(_sb_df_raw.columns) > 8 else ''}\n\n"
-                        "Ask me anything about your data!"
-                    )
+                        _intro
+                        + f"**{len(_sb_df_raw):,} rows** × **{len(_sb_df_raw.columns)} columns**\n"
+                        + f"Columns: {', '.join(_sb_df_raw.columns.tolist()[:8])}"
+                        + (f"…" if len(_sb_df_raw.columns) > 8 else "") + "\n\n"
+                        + "Ask me anything about your data!"
+                    ),
                 }]
-            st.success(f"✓ {len(_sb_df_raw):,} rows loaded")
+                # Clear AI chart cache when new files are loaded
+                st.session_state.ai_charts_suggestions = None
+                st.session_state.ai_charts_cache_key   = ""
 
-        except Exception as e:
-            st.error(f"Error: {e}")
+            if len(uploaded) == 1:
+                st.success(f"✓ {len(_sb_df_raw):,} rows loaded")
+            else:
+                st.success(f"✓ {len(uploaded)} files · {len(_sb_df_raw):,} rows merged")
 
     # ── SESSION CONTROLS ──────────────────────────────────────────
     st.markdown("---")
@@ -1699,6 +1695,24 @@ with st.sidebar:
             st.session_state.active_page = _pg
             st.rerun()
 
+# ─────────────────────────────────────────────
+# PHASE 2: Chart Theme in Sidebar (1 customization option)
+# ─────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("---")
+    st.markdown("### 🎨 Chart Theme")
+    _theme_choice = st.selectbox(
+        "Visual style for all charts",
+        list(CHART_THEMES.keys()),
+        index=list(CHART_THEMES.keys()).index(st.session_state.get("chart_theme", "Default")),
+        key="sidebar_chart_theme",
+        help="Changes the color palette for all charts in the app",
+    )
+    if _theme_choice != st.session_state.get("chart_theme", "Default"):
+        st.session_state.chart_theme = _theme_choice
+        # Also clear AI chart cache so it re-renders with new theme
+        st.session_state.pop("ai_charts_cache", None)
+        st.rerun()
 
 # ─────────────────────────────────────────────
 # Main Content
@@ -1733,34 +1747,45 @@ if df is None:
     up_col1, up_col2, up_col3 = st.columns([1, 2, 1])
     with up_col2:
         main_upload = st.file_uploader(
-            "Drop your file here or click to browse",
+            "Drop one or more files here, or click to browse",
             type=["xlsx", "xls", "csv"],
+            accept_multiple_files=True,
             key="main_uploader",
+            help="Upload multiple files to merge them automatically into one dataset",
         )
         if main_upload:
-            try:
-                if main_upload.name.endswith(".csv"):
-                    _df_raw = pd.read_csv(main_upload)
+            _df_raw, _df_loaded, _label, _errors = load_files(
+                main_upload, st.session_state.masked_cols
+            )
+            for err in _errors:
+                st.error(err)
+
+            if _df_raw is not None:
+                st.session_state.df_raw    = _df_raw
+                st.session_state.file_name = _label
+                st.session_state.df        = _df_loaded
+                st.session_state.profile   = profile_dataframe(_df_loaded)
+
+                n_files = len(main_upload)
+                if n_files == 1:
+                    _intro = f"✅ **{main_upload[0].name}** loaded!\n\n"
                 else:
-                    _df_raw = pd.read_excel(main_upload)
-                st.session_state.df_raw   = _df_raw
-                st.session_state.file_name = main_upload.name
-                _df_loaded = apply_masking(_df_raw, st.session_state.masked_cols)
-                st.session_state.df      = _df_loaded
-                st.session_state.profile = profile_dataframe(_df_loaded)
+                    _intro = f"✅ **{n_files} files merged** into one dataset!\n\n"
+                    _intro += "\n".join(f"  - {f.name}" for f in main_upload) + "\n\n"
+
                 st.session_state.messages = [{
                     "role": "assistant",
                     "content": (
-                        f"✅ **{main_upload.name}** loaded successfully!\n\n"
-                        f"- **{len(_df_raw):,} rows** × **{len(_df_raw.columns)} columns**\n"
-                        f"- Columns: {', '.join(_df_raw.columns.tolist()[:8])}"
-                        f"{'...' if len(_df_raw.columns) > 8 else ''}\n\n"
-                        "Ask me anything about your data!"
+                        _intro
+                        + f"**{len(_df_raw):,} rows** × **{len(_df_raw.columns)} columns**\n"
+                        + f"Columns: {', '.join(_df_raw.columns.tolist()[:8])}"
+                        + ("…" if len(_df_raw.columns) > 8 else "") + "\n\n"
+                        + "Ask me anything about your data!"
                     ),
                 }]
+                st.session_state.ai_charts_suggestions = None
+                st.session_state.ai_charts_cache_key   = ""
                 st.rerun()
-            except Exception as e:
-                st.error(f"Upload error: {e}")
 
         # Also show provider + API key selection inline
         st.markdown("---")
@@ -1814,9 +1839,38 @@ if df is None and _active != "💬 Chat":
 # Compatibility shims so existing tab_* guards still work
 tab_fleet = tab_data = tab_profile = tab_stats = tab_viz = True if df is not None else None
 
-# ── Chat Page ─────────────────────────────────
+
+# ─────────────────────────────────────────────
+# PHASE 3: Auto-scroll helper (quick question UX fix)
+# ─────────────────────────────────────────────
+def scroll_to_bottom():
+    """Inject JS that scrolls Streamlit's main scroll container to the bottom."""
+    st.markdown("""
+        <script>
+        (function() {
+            var container = window.parent.document.querySelector(
+                'section[data-testid="stMain"] > div:first-child'
+            );
+            if (container) {
+                setTimeout(function() { container.scrollTop = container.scrollHeight; }, 120);
+            }
+        })();
+        </script>
+    """, unsafe_allow_html=True)
+
+# ── Single-page routing (replaces st.tabs) ────────────────────────────────────
+_active = st.session_state.active_page
+# Ensure page resets to Chat when no file loaded
+if df is None and _active != "💬 Chat":
+    st.session_state.active_page = "💬 Chat"
+    _active = "💬 Chat"
+
+# Compatibility shims so existing tab_* guards still work
+tab_fleet = tab_data = tab_profile = tab_stats = tab_viz = True if df is not None else None
+
+# ── Chat Page (Phase 3 integrated) ────────────────────────────────
 if _active == "💬 Chat":
-    # Quick prompts
+    # Quick prompts bar
     if df is not None:
         st.markdown("**Quick Analysis:**")
         cols_q = st.columns(6)
@@ -1832,9 +1886,15 @@ if _active == "💬 Chat":
             with cols_q[i % 6]:
                 if st.button(label, key=f"qp_{i}", use_container_width=True):
                     st.session_state.messages.append({"role": "user", "content": prompt})
+                    st.session_state._just_jumped = True
                     st.rerun()
 
         st.markdown("---")
+
+    # ── PHASE 3: Auto-scroll when arriving from quick question ──
+    if st.session_state.get("_just_jumped"):
+        scroll_to_bottom()
+        st.session_state._just_jumped = False
 
     # Chat history
     chat_container = st.container()
@@ -1850,23 +1910,17 @@ if _active == "💬 Chat":
             else:
                 with st.chat_message("assistant", avatar="📊"):
                     st.markdown(msg["content"])
-                    # Render stored chart(s) if any
                     if idx in st.session_state.charts:
-                        stored = st.session_state.charts[idx]
-                        if isinstance(stored, list):
-                            for _fi, _fig in enumerate(stored):
-                                st.plotly_chart(_fig, use_container_width=True,
-                                                key=f"chart_hist_{idx}_{_fi}")
-                        else:
-                            st.plotly_chart(stored, use_container_width=True,
-                                            key=f"chart_hist_{idx}")
+                        th = get_theme()
+                        stored_fig = st.session_state.charts[idx]
+                        stored_fig.update_layout(template=th["template"])
+                        st.plotly_chart(stored_fig, use_container_width=True, key=f"chart_hist_{idx}")
 
     # Respond to last user message if no assistant reply yet
     msgs = st.session_state.messages
     if msgs and msgs[-1]["role"] == "user" and df is not None:
         last_question = msgs[-1]["content"]
         context = build_context(df, st.session_state.profile)
-        # Keep only last 6 messages to avoid token overflow
         recent_msgs = msgs[-6:] if len(msgs) > 6 else msgs
         api_msgs = [{"role": m["role"], "content": m["content"]} for m in recent_msgs]
 
@@ -1880,60 +1934,41 @@ if _active == "💬 Chat":
                     response_placeholder.markdown(full_response + "▌")
                 response_placeholder.markdown(full_response)
 
-            # Detect chart intent from BOTH user question AND AI response
             chart_type = detect_chart_intent(last_question, full_response)
-
-            # ── Fleet quick-question chart (priority) ────────────────
-            fleet_figs = []
-            quick_chart_key = st.session_state.get("quick_chart")
-            if quick_chart_key and df is not None:
-                _fc   = detect_vessel_dataset(df)
-                _hfdf = build_hotfix_summary(df, _fc.get("hotfix_cols", [])) if _fc.get("hotfix_cols") else pd.DataFrame()
-                fleet_figs = generate_fleet_chart(quick_chart_key, df, _fc, _hfdf)
-                st.session_state.quick_chart = None   # consume it
-
-            if fleet_figs:
-                for _fi, _fig in enumerate(fleet_figs):
-                    st.plotly_chart(_fig, use_container_width=True,
-                                    key=f"fleet_chart_new_{len(msgs)}_{_fi}")
-                # Store list of figs in charts dict (serialised as list)
-                st.session_state.charts[len(msgs)] = fleet_figs
-
-            # ── Generic chart from question intent (fallback) ────────
-            elif chart_type:
+            if chart_type:
                 with st.spinner("Generating chart..."):
                     fig = generate_chart(last_question, df, chart_type)
                 if fig:
+                    th = get_theme()
+                    fig.update_layout(template=th["template"])
                     chart_placeholder = st.empty()
                     chart_placeholder.plotly_chart(fig, use_container_width=True, key=f"chart_new_{len(msgs)}")
                     st.session_state.charts[len(msgs)] = fig
 
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": full_response
-        })
+        st.session_state.messages.append({"role": "assistant", "content": full_response})
         st.rerun()
 
-    # No file uploaded state
     if df is None:
         st.info("👈 Upload an Excel or CSV file in the sidebar to start analyzing your data.")
 
-    # Show banner if quick question queued from Fleet Dashboard
-    if st.session_state.get("quick_question") and df is not None:
-        st.info(f"⚡ Quick question queued: **{st.session_state.quick_question[:80]}…**  \nProcessing now…")
-
-    # Chat input — also handles quick-access buttons from Fleet Dashboard
+    # ── PHASE 3: Quick question input (from Fleet Dashboard) ──────
     if df is not None:
+        # If arriving from a quick question click, show banner
+        if st.session_state.get("quick_question") and df is not None:
+            st.info(f"⚡ Sending: **{st.session_state.quick_question[:80]}**…")
+
         user_input = st.chat_input("Ask anything about your data…")
-        # Quick-access button fired from Fleet Dashboard
-        if st.session_state.get("quick_question"):
-            user_input = st.session_state.quick_question
+
+        # PHASE 3: Consume quick_question if set (clears immediately to prevent loop)
+        qq = st.session_state.get("quick_question")
+        if qq:
             st.session_state.quick_question = None
-            # quick_chart is consumed later during response generation
+            user_input = qq
+
         if user_input:
             st.session_state.messages.append({"role": "user", "content": user_input})
+            st.session_state._just_jumped = True
             st.rerun()
-
 
 # ═══════════════════════════════════════════════════════════════════════
 # 🚢 FLEET DASHBOARD PAGE  — Wide-format vessel deployment data
@@ -2052,10 +2087,14 @@ if _active == "🚢 Fleet Dashboard" and df is not None:
       st.markdown("## 💬 Quick Analysis — Click to Ask the AI")
       st.caption("Click any button below — the question goes straight to the Chat tab and gets answered instantly.")
 
-      def _ask(label, q):
-          st.session_state.quick_question = q
-          st.session_state.quick_chart    = QUICK_CHART_MAP.get(label)
+
+      # ── PHASE 3: Updated _ask() — direct submit, no queue loop ─────
+      def _ask(q):
+          """Send a quick question directly into chat history and switch page."""
+          st.session_state.messages.append({"role": "user", "content": q})
           st.session_state.active_page = "💬 Chat"
+          st.session_state._just_jumped = True   # triggers auto-scroll on Chat page
+          st.session_state.quick_question = None  # clear any stale queue
           st.rerun()
 
       quick_groups = [
@@ -2117,9 +2156,8 @@ if _active == "🚢 Fleet Dashboard" and df is not None:
                           use_container_width=True,
                           help=full_q,
                       ):
-                          _ask(label, full_q)
+                          _ask(full_q)
           st.markdown("")
-
   # ════════════════════════════════════════════════════════════════
   # 1. DEPLOYMENT & UPGRADE ANALYSIS
   # ════════════════════════════════════════════════════════════════
@@ -3183,6 +3221,23 @@ if _active == "🚢 Fleet Dashboard" and df is not None:
 
 # ── Data Preview Page ─────────────────────────
 if _active == "🗃 Data Preview" and df is not None:
+      # ── Multi-file source summary (only shown when >1 file merged) ──
+      if "_source_file" in df.columns:
+          src_counts = df["_source_file"].value_counts().reset_index()
+          src_counts.columns = ["File", "Rows"]
+          src_counts["% of Total"] = (src_counts["Rows"] / len(df) * 100).round(1).astype(str) + "%"
+          with st.expander(f"📂 {src_counts.shape[0]} files merged — click to see breakdown", expanded=True):
+              st.dataframe(src_counts, use_container_width=True, hide_index=True)
+              _filter_file = st.selectbox(
+                  "Filter to one file (optional)",
+                  ["All files"] + src_counts["File"].tolist(),
+                  key="dp_file_filter",
+              )
+              if _filter_file != "All files":
+                  df = df[df["_source_file"] == _filter_file]
+                  st.caption(f"Showing {len(df):,} rows from **{_filter_file}**")
+          st.markdown("---")
+
       st.markdown(f"**Showing first 200 rows of {len(df):,} total**")
 
       col_filter, col_search = st.columns([3, 1])
@@ -3316,834 +3371,902 @@ if _active == "📈 Statistics" and df is not None:
           )
 
 
-# ── Visual Analytics Page ──────────────────────
+
+# ── Visual Analytics Page (Phase 1: AI Auto-Charts + 1 manual customization) ──
 if _active == "📊 Visual Analytics" and df is not None:
-      num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-      cat_cols = df.select_dtypes(exclude=[np.number]).columns.tolist()
-      all_cols = df.columns.tolist()
+    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    cat_cols = df.select_dtypes(exclude=[np.number]).columns.tolist()
+    all_cols = df.columns.tolist()
 
-      # Auto-detect date columns
-      date_cols = []
-      for _c in all_cols:
-          if "datetime" in str(df[_c].dtype):
-              date_cols.append(_c)
-          elif df[_c].dtype == object:
-              try:
-                  _s = pd.to_datetime(df[_c].dropna().head(50), errors="coerce")
-                  if _s.notna().sum() > 30:
-                      date_cols.append(_c)
-              except Exception:
-                  pass
+    # Auto-detect date columns
+    date_cols = []
+    for _c in all_cols:
+        if "datetime" in str(df[_c].dtype):
+            date_cols.append(_c)
+        elif df[_c].dtype == object:
+            try:
+                _s = pd.to_datetime(df[_c].dropna().head(50), errors="coerce")
+                if _s.notna().sum() > 30:
+                    date_cols.append(_c)
+            except Exception:
+                pass
 
-      TPL = "plotly_white"
-      COLORS = px.colors.qualitative.Set2
-      PALETTES = ["Blues","Greens","Reds","Purples","Oranges","Teal","Magenta"]
+    theme = get_theme()
+    TPL    = theme["template"]
+    COLORS = theme["colors"]
+    PALETTES = ["Blues","Greens","Reds","Purples","Oranges","Teal","Magenta"]
 
-      # ── KPI Banner ───────────────────────────────────────────────────
-      st.markdown("### 📊 Visual Analytics")
-      k1,k2,k3,k4,k5,k6 = st.columns(6)
-      k1.metric("Rows", f"{len(df):,}")
-      k2.metric("Columns", len(df.columns))
-      k3.metric("Numeric", len(num_cols))
-      k4.metric("Categorical", len(cat_cols))
-      k5.metric("Date cols", len(date_cols))
-      missing_pct = round(df.isna().sum().sum()/(len(df)*len(df.columns))*100,1) if len(df)>0 else 0
-      k6.metric("Missing %", f"{missing_pct}%")
-      st.markdown("---")
+    # ── KPI Banner ──────────────────────────────────────────────────────
+    st.markdown("### 📊 Visual Analytics")
+    k1,k2,k3,k4,k5,k6 = st.columns(6)
+    k1.metric("Rows", f"{len(df):,}")
+    k2.metric("Columns", len(df.columns))
+    k3.metric("Numeric", len(num_cols))
+    k4.metric("Categorical", len(cat_cols))
+    k5.metric("Date cols", len(date_cols))
+    missing_pct = round(df.isna().sum().sum()/(len(df)*len(df.columns))*100,1) if len(df)>0 else 0
+    k6.metric("Missing %", f"{missing_pct}%")
+    st.markdown("---")
 
-      # ── SECTION NAVIGATOR ────────────────────────────────────────────
-      sections = [
-          "1️⃣ Distribution",
-          "2️⃣ Comparison",
-          "3️⃣ Relationship / Scatter",
-          "4️⃣ Composition",
-          "5️⃣ Time Series",
-          "6️⃣ Ranking",
-          "7️⃣ Correlation",
-          "8️⃣ Multi-Group Comparison",
-          "9️⃣ Custom Chart Builder",
-          "🔟 Missing Data Map",
-          "1️⃣1️⃣ Pair Plot",
-      ]
-      active_section = st.selectbox("Jump to section", sections, key="viz_section")
-      st.markdown("---")
+    # ═══════════════════════════════════════════════════════════════
+    # PHASE 1 — AI AUTO-GENERATED CHARTS
+    # ═══════════════════════════════════════════════════════════════
+    st.markdown("#### 🤖 AI-Suggested Charts")
+    st.caption("Automatically generated based on your dataset. Charts refresh when you upload a new file or click Regenerate.")
 
-      # helper
-      def std_layout(fig, h=420):
-          fig.update_layout(
-              margin=dict(t=45,b=30,l=25,r=25), height=h,
-              font=dict(family="DM Sans, sans-serif", size=12),
-              legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-          )
-          return fig
+    # Build a stable cache key from file + columns + provider + model
+    _col_sig = "|".join(all_cols[:20])
+    _cache_key = f"{st.session_state.file_name}|{_col_sig}|{st.session_state.provider}|{st.session_state.model}"
 
-      # ═══════════════════════════════════════════════════════════════
-      # 1️⃣ DISTRIBUTION
-      # ═══════════════════════════════════════════════════════════════
-      if "Distribution" in active_section:
-          st.markdown("#### 1️⃣ Distribution Explorer")
-          ctrl, chart_area = st.columns([1,3])
-          with ctrl:
-              dist_col  = st.selectbox("Column", all_cols, key="d_col")
-              dist_type = st.selectbox("Chart type", ["Histogram","Box Plot","Violin","ECDF","Strip Plot","Bar (Top N)"], key="d_type")
-              dist_pal  = st.selectbox("Color palette", PALETTES, key="d_pal")
-              dist_bins = st.slider("Bins (histogram)", 5, 100, 30, key="d_bins")
-              dist_topn = st.slider("Top N (bar)", 5, 50, 20, key="d_topn")
-              dist_grp  = st.selectbox("Split/Color by", ["None"]+cat_cols, key="d_grp")
-              show_mean = st.checkbox("Show mean line", True, key="d_mean")
+    # Check if we have cached suggestions for this file+provider
+    if "ai_charts_cache_key" not in st.session_state or st.session_state.ai_charts_cache_key != _cache_key:
+        st.session_state.ai_charts_suggestions = None
+        st.session_state.ai_charts_cache_key = _cache_key
 
-          with chart_area:
-              grp_arg = dist_grp if dist_grp != "None" else None
-              if pd.api.types.is_numeric_dtype(df[dist_col]):
-                  if dist_type == "Histogram":
-                      fig = px.histogram(df, x=dist_col, nbins=dist_bins, color=grp_arg,
-                          color_discrete_sequence=COLORS, template=TPL,
-                          title=f"Distribution of {dist_col}", marginal="rug",
-                          barmode="overlay", opacity=0.75)
-                      if show_mean:
-                          mean_val = df[dist_col].mean()
-                          fig.add_vline(x=mean_val, line_dash="dash", line_color="red",
-                              annotation_text=f"Mean: {mean_val:.2f}")
-                  elif dist_type == "Box Plot":
-                      fig = px.box(df, y=dist_col, x=grp_arg, color=grp_arg,
-                          color_discrete_sequence=COLORS, template=TPL,
-                          title=f"Box Plot — {dist_col}", points="outliers")
-                  elif dist_type == "Violin":
-                      fig = px.violin(df, y=dist_col, x=grp_arg, color=grp_arg,
-                          color_discrete_sequence=COLORS, template=TPL,
-                          title=f"Violin — {dist_col}", box=True, points="outliers")
-                  elif dist_type == "ECDF":
-                      fig = px.ecdf(df, x=dist_col, color=grp_arg,
-                          color_discrete_sequence=COLORS, template=TPL,
-                          title=f"ECDF — {dist_col}")
-                  elif dist_type == "Strip Plot":
-                      fig = px.strip(df, y=dist_col, x=grp_arg, color=grp_arg,
-                          color_discrete_sequence=COLORS, template=TPL,
-                          title=f"Strip Plot — {dist_col}")
-                  else:
-                      vc = df[dist_col].dropna().astype(str).value_counts().head(dist_topn).reset_index()
-                      vc.columns=["Value","Count"]
-                      fig = px.bar(vc, x="Value", y="Count", color="Count",
-                          color_continuous_scale=dist_pal, template=TPL,
-                          title=f"Top {dist_topn} values — {dist_col}")
-              else:
-                  vc = df[dist_col].fillna("(blank)").astype(str).value_counts().head(dist_topn).reset_index()
-                  vc.columns=["Value","Count"]
-                  if dist_type in ("Histogram","Bar (Top N)"):
-                      fig = px.bar(vc, x="Value", y="Count", color="Count",
-                          color_continuous_scale=dist_pal, template=TPL,
-                          title=f"Top {dist_topn} — {dist_col}")
-                      fig.update_xaxes(tickangle=-35)
-                  elif dist_type == "Box Plot":
-                      st.info("Box plot needs a numeric column. Showing bar instead.")
-                      fig = px.bar(vc, x="Value", y="Count", template=TPL)
-                  else:
-                      fig = px.pie(vc.head(12), names="Value", values="Count",
-                          title=f"Distribution — {dist_col}", template=TPL,
-                          color_discrete_sequence=COLORS, hole=0.3)
-              st.plotly_chart(std_layout(fig), use_container_width=True)
+    regen_col, info_col = st.columns([1, 5])
+    with regen_col:
+        if st.button("🔄 Regenerate Charts", key="regen_ai_charts", use_container_width=True):
+            st.session_state.ai_charts_suggestions = None
+            st.session_state.ai_charts_cache_key = ""
 
-      # ═══════════════════════════════════════════════════════════════
-      # 2️⃣ COMPARISON
-      # ═══════════════════════════════════════════════════════════════
-      elif "Comparison" in active_section:
-          st.markdown("#### 2️⃣ Comparison")
-          c1,c2,c3 = st.columns(3)
-          with c1:
-              cmp_grp   = st.selectbox("Group by (X)", cat_cols if cat_cols else all_cols, key="cmp_grp")
-              cmp_val   = st.selectbox("Value (Y)", ["Row Count"]+num_cols, key="cmp_val")
-              cmp_agg   = st.selectbox("Aggregation", ["Count","Sum","Mean","Median","Max","Min","Std"], key="cmp_agg")
-          with c2:
-              cmp_chart = st.selectbox("Chart type", ["Vertical Bar","Horizontal Bar","Grouped Bar","Lollipop","Waterfall","Bullet"], key="cmp_chart")
-              cmp_color = st.selectbox("Color by", ["None"]+cat_cols, key="cmp_color")
-              cmp_topn  = st.slider("Top N", 5, 50, 20, key="cmp_topn")
-          with c3:
-              cmp_sort  = st.radio("Sort", ["Descending","Ascending","Alphabetical"], key="cmp_sort")
-              cmp_pal   = st.selectbox("Palette", PALETTES, key="cmp_pal")
-              show_vals = st.checkbox("Show values on bars", True, key="cmp_showval")
+    with info_col:
+        if not st.session_state.api_key:
+            st.warning("⚠️ Add an API key in the sidebar to enable AI chart suggestions.")
 
-          agg_map = {"Count":"count","Sum":"sum","Mean":"mean","Median":"median","Max":"max","Min":"min","Std":"std"}
-          if cmp_val == "Row Count":
-              cmp_df = df[cmp_grp].fillna("(blank)").astype(str).value_counts().head(cmp_topn).reset_index()
-              cmp_df.columns=[cmp_grp,"Value"]
-              y_label = "Count"
-          else:
-              cmp_df = (df.groupby(df[cmp_grp].fillna("(blank)").astype(str))[cmp_val]
-                  .agg(agg_map[cmp_agg]).round(2).reset_index())
-              cmp_df.columns=[cmp_grp,"Value"]
-              y_label = f"{cmp_agg} of {cmp_val}"
+    # Load suggestions if not cached
+    if st.session_state.get("ai_charts_suggestions") is None and st.session_state.api_key:
+        with st.spinner("🤖 AI is analyzing your data and selecting the best charts…"):
+            suggestions = ai_suggest_charts(df, st.session_state.profile)
+            st.session_state.ai_charts_suggestions = suggestions
+            st.session_state.ai_charts_cache_key = _cache_key
+    elif st.session_state.get("ai_charts_suggestions") is None:
+        # No API key — generate some sensible defaults without AI
+        suggestions = []
+        if cat_cols and num_cols:
+            suggestions.append({"type":"bar","x":cat_cols[0],"y":num_cols[0],"title":f"{num_cols[0]} by {cat_cols[0]}","insight":f"Distribution of {num_cols[0]} across {cat_cols[0]} categories."})
+        if len(num_cols) >= 2:
+            suggestions.append({"type":"scatter","x":num_cols[0],"y":num_cols[1],"title":f"{num_cols[0]} vs {num_cols[1]}","insight":f"Correlation between {num_cols[0]} and {num_cols[1]}."})
+        if len(num_cols) >= 2:
+            suggestions.append({"type":"heatmap","x":None,"y":None,"title":"Correlation Heatmap","insight":"Correlations between all numeric columns."})
+        if cat_cols:
+            suggestions.append({"type":"pie","x":cat_cols[0],"y":None,"title":f"Distribution of {cat_cols[0]}","insight":f"Proportional breakdown of {cat_cols[0]}."})
+        if num_cols:
+            suggestions.append({"type":"histogram","x":num_cols[0],"y":None,"title":f"Distribution of {num_cols[0]}","insight":f"Frequency distribution of {num_cols[0]}."})
+        st.session_state.ai_charts_suggestions = suggestions
+    else:
+        suggestions = st.session_state.ai_charts_suggestions
 
-          if cmp_sort == "Descending":
-              cmp_df = cmp_df.sort_values("Value", ascending=False).head(cmp_topn)
-          elif cmp_sort == "Ascending":
-              cmp_df = cmp_df.sort_values("Value", ascending=True).head(cmp_topn)
-          else:
-              cmp_df = cmp_df.sort_values(cmp_grp).head(cmp_topn)
+    # Render AI charts in a 2-column grid
+    if suggestions:
+        for row_start in range(0, len(suggestions), 2):
+            cols_pair = st.columns(2)
+            for col_idx, cfg in enumerate(suggestions[row_start:row_start+2]):
+                with cols_pair[col_idx]:
+                    st.markdown(f"**{cfg.get('title', 'Chart')}**")
+                    render_ai_chart(cfg, df, chart_idx=row_start + col_idx)
+    else:
+        st.info("No chart suggestions available. Check your API key in the sidebar.")
 
-          color_arg = cmp_color if cmp_color != "None" else None
+    st.markdown("---")
 
-          if cmp_chart == "Vertical Bar":
-              fig = px.bar(cmp_df, x=cmp_grp, y="Value", color=cmp_grp if not color_arg else color_arg,
-                  color_discrete_sequence=COLORS, color_continuous_scale=cmp_pal,
-                  title=f"{y_label} by {cmp_grp}", template=TPL, text_auto=show_vals)
-              fig.update_xaxes(tickangle=-35)
-          elif cmp_chart == "Horizontal Bar":
-              fig = px.bar(cmp_df, y=cmp_grp, x="Value", orientation="h",
-                  color="Value", color_continuous_scale=cmp_pal,
-                  title=f"{y_label} by {cmp_grp}", template=TPL, text_auto=show_vals)
-          elif cmp_chart == "Grouped Bar":
-              if color_arg and color_arg in df.columns:
-                  sub = df.groupby([cmp_grp, color_arg])[cmp_val if cmp_val!="Row Count" else cmp_grp].agg(
-                      agg_map[cmp_agg] if cmp_val!="Row Count" else "count").round(2).reset_index()
-                  sub.columns = [cmp_grp, color_arg, "Value"]
-                  fig = px.bar(sub, x=cmp_grp, y="Value", color=color_arg,
-                      barmode="group", template=TPL, color_discrete_sequence=COLORS,
-                      title=f"Grouped — {y_label} by {cmp_grp} & {color_arg}", text_auto=show_vals)
-                  fig.update_xaxes(tickangle=-35)
-              else:
-                  st.warning("Select a 'Color by' column for grouped bar.")
-                  fig = px.bar(cmp_df, x=cmp_grp, y="Value", template=TPL)
-          elif cmp_chart == "Lollipop":
-              fig = go.Figure()
-              for _, row in cmp_df.iterrows():
-                  fig.add_shape(type="line", x0=row[cmp_grp], x1=row[cmp_grp], y0=0, y1=row["Value"],
-                      line=dict(color="#3b82f6", width=2))
-              fig.add_trace(go.Scatter(x=cmp_df[cmp_grp], y=cmp_df["Value"],
-                  mode="markers+text" if show_vals else "markers",
-                  marker=dict(size=12, color="#3b82f6"),
-                  text=cmp_df["Value"].round(1) if show_vals else None,
-                  textposition="top center"))
-              fig.update_layout(title=f"{y_label} by {cmp_grp}", template=TPL,
-                  xaxis_tickangle=-35)
-          elif cmp_chart == "Waterfall":
-              fig = go.Figure(go.Waterfall(
-                  name="value", orientation="v",
-                  x=cmp_df[cmp_grp].tolist(),
-                  y=cmp_df["Value"].tolist(),
-                  connector={"line":{"color":"#94a3b8"}},
-              ))
-              fig.update_layout(title=f"Waterfall — {y_label}", template=TPL)
-          else:  # Bullet
-              fig = go.Figure()
-              max_v = cmp_df["Value"].max()
-              for i, row in cmp_df.iterrows():
-                  fig.add_trace(go.Indicator(
-                      mode="number+gauge", value=row["Value"],
-                      domain={"x":[0,1],"y":[(i)/len(cmp_df),(i+0.85)/len(cmp_df)]},
-                      title={"text": str(row[cmp_grp])[:20]},
-                      gauge={"axis":{"range":[0,max_v]},
-                             "bar":{"color":"#3b82f6"},
-                             "bgcolor":"#e2e8f0"}
-                  ))
-              fig.update_layout(title=f"Bullet — {y_label}", height=max(400, len(cmp_df)*60))
+    # ═══════════════════════════════════════════════════════════════
+    # MANUAL CHART BUILDER (kept as expander — all original sections)
+    # ═══════════════════════════════════════════════════════════════
+    with st.expander("🛠 Advanced / Manual Chart Builder", expanded=False):
+        st.caption("Full control over all chart types and settings. All original sections available below.")
 
-          st.plotly_chart(std_layout(fig), use_container_width=True)
+        sections = [
+            "1️⃣ Distribution",
+            "2️⃣ Comparison",
+            "3️⃣ Relationship / Scatter",
+            "4️⃣ Composition",
+            "5️⃣ Time Series",
+            "6️⃣ Ranking",
+            "7️⃣ Correlation",
+            "8️⃣ Multi-Group Comparison",
+            "9️⃣ Custom Chart Builder",
+            "🔟 Missing Data Map",
+            "1️⃣1️⃣ Pair Plot",
+        ]
+        active_section = st.selectbox("Jump to section", sections, key="viz_section")
+        st.markdown("---")
 
-      # ═══════════════════════════════════════════════════════════════
-      # 3️⃣ RELATIONSHIP / SCATTER
-      # ═══════════════════════════════════════════════════════════════
-      elif "Relationship" in active_section:
-          st.markdown("#### 3️⃣ Relationship / Scatter")
-          if len(num_cols) < 2:
-              st.info("Need at least 2 numeric columns.")
-          else:
-              r1,r2,r3,r4 = st.columns(4)
-              with r1:
-                  rx = st.selectbox("X axis", num_cols, index=0, key="rx")
-                  ry = st.selectbox("Y axis", num_cols, index=min(1,len(num_cols)-1), key="ry")
-              with r2:
-                  rcolor = st.selectbox("Color by", ["None"]+cat_cols+num_cols, key="rcolor")
-                  rsize  = st.selectbox("Size by", ["None"]+num_cols, key="rsize")
-              with r3:
-                  rstype = st.selectbox("Chart", ["Scatter","Bubble","Density Contour","Density Heatmap","Line"], key="rstype")
-                  rtrendline = st.selectbox("Trendline", ["None","OLS","Lowess"], key="rtl")
-              with r4:
-                  rfacet = st.selectbox("Facet by (small multiples)", ["None"]+cat_cols, key="rfacet")
-                  rsample = st.slider("Max points", 100, 5000, 2000, 100, key="rsample")
+        def std_layout(fig, h=420):
+            fig.update_layout(
+                margin=dict(t=45,b=30,l=25,r=25), height=h,
+                font=dict(family="DM Sans, sans-serif", size=12),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                template=TPL,
+            )
+            return fig
 
-              plot_df = df.sample(min(rsample, len(df)))
-              kw = dict(data_frame=plot_df, x=rx, y=ry, template=TPL, opacity=0.65,
-                  title=f"{rx} vs {ry}")
-              if rcolor != "None": kw["color"] = rcolor
-              if rfacet != "None": kw["facet_col"] = rfacet; kw["facet_col_wrap"] = 3
-              tl_map = {"OLS":"ols","Lowess":"lowess","None":None}
-              tl = tl_map[rtrendline]
+        # ═══════════════════════════════════════════════════════════════
+        # 1️⃣ DISTRIBUTION
+        # ═══════════════════════════════════════════════════════════════
+        if "Distribution" in active_section:
+            st.markdown("#### 1️⃣ Distribution Explorer")
+            ctrl, chart_area = st.columns([1,3])
+            with ctrl:
+                dist_col  = st.selectbox("Column", all_cols, key="d_col")
+                dist_type = st.selectbox("Chart type", ["Histogram","Box Plot","Violin","ECDF","Strip Plot","Bar (Top N)"], key="d_type")
+                dist_pal  = st.selectbox("Color palette", PALETTES, key="d_pal")
+                dist_bins = st.slider("Bins (histogram)", 5, 100, 30, key="d_bins")
+                dist_topn = st.slider("Top N (bar)", 5, 50, 20, key="d_topn")
+                dist_grp  = st.selectbox("Split/Color by", ["None"]+cat_cols, key="d_grp")
+                show_mean = st.checkbox("Show mean line", True, key="d_mean")
 
-              if rstype == "Scatter":
-                  if tl: kw["trendline"] = tl
-                  fig = px.scatter(**kw, color_discrete_sequence=COLORS)
-              elif rstype == "Bubble":
-                  if rsize != "None":
-                      kw["size"] = rsize; kw["size_max"] = 25
-                  fig = px.scatter(**kw, color_discrete_sequence=COLORS)
-              elif rstype == "Density Contour":
-                  fig = px.density_contour(**kw, color_discrete_sequence=COLORS)
-                  fig.update_traces(contours_coloring="fill", contours_showlabels=True)
-              elif rstype == "Density Heatmap":
-                  fig = px.density_heatmap(plot_df, x=rx, y=ry, nbinsx=30, nbinsy=30,
-                      color_continuous_scale="Blues", template=TPL, title=f"{rx} vs {ry}")
-              else:  # Line
-                  ldf = df[[rx,ry]].dropna().sort_values(rx)
-                  fig = px.line(ldf, x=rx, y=ry, template=TPL, title=f"{ry} vs {rx}",
-                      color_discrete_sequence=["#3b82f6"])
+            with chart_area:
+                grp_arg = dist_grp if dist_grp != "None" else None
+                if pd.api.types.is_numeric_dtype(df[dist_col]):
+                    if dist_type == "Histogram":
+                        fig = px.histogram(df, x=dist_col, nbins=dist_bins, color=grp_arg,
+                            color_discrete_sequence=COLORS, template=TPL,
+                            title=f"Distribution of {dist_col}", marginal="rug",
+                            barmode="overlay", opacity=0.75)
+                        if show_mean:
+                            mean_val = df[dist_col].mean()
+                            fig.add_vline(x=mean_val, line_dash="dash", line_color="red",
+                                annotation_text=f"Mean: {mean_val:.2f}")
+                    elif dist_type == "Box Plot":
+                        fig = px.box(df, y=dist_col, x=grp_arg, color=grp_arg,
+                            color_discrete_sequence=COLORS, template=TPL,
+                            title=f"Box Plot — {dist_col}", points="outliers")
+                    elif dist_type == "Violin":
+                        fig = px.violin(df, y=dist_col, x=grp_arg, color=grp_arg,
+                            color_discrete_sequence=COLORS, template=TPL,
+                            title=f"Violin — {dist_col}", box=True, points="outliers")
+                    elif dist_type == "ECDF":
+                        fig = px.ecdf(df, x=dist_col, color=grp_arg,
+                            color_discrete_sequence=COLORS, template=TPL,
+                            title=f"ECDF — {dist_col}")
+                    elif dist_type == "Strip Plot":
+                        fig = px.strip(df, y=dist_col, x=grp_arg, color=grp_arg,
+                            color_discrete_sequence=COLORS, template=TPL,
+                            title=f"Strip Plot — {dist_col}")
+                    else:
+                        vc = df[dist_col].dropna().astype(str).value_counts().head(dist_topn).reset_index()
+                        vc.columns=["Value","Count"]
+                        fig = px.bar(vc, x="Value", y="Count", color="Count",
+                            color_continuous_scale=dist_pal, template=TPL,
+                            title=f"Top {dist_topn} values — {dist_col}")
+                else:
+                    vc = df[dist_col].fillna("(blank)").astype(str).value_counts().head(dist_topn).reset_index()
+                    vc.columns=["Value","Count"]
+                    if dist_type in ("Histogram","Bar (Top N)"):
+                        fig = px.bar(vc, x="Value", y="Count", color="Count",
+                            color_continuous_scale=dist_pal, template=TPL,
+                            title=f"Top {dist_topn} — {dist_col}")
+                        fig.update_xaxes(tickangle=-35)
+                    elif dist_type == "Box Plot":
+                        st.info("Box plot needs a numeric column. Showing bar instead.")
+                        fig = px.bar(vc, x="Value", y="Count", template=TPL)
+                    else:
+                        fig = px.pie(vc.head(12), names="Value", values="Count",
+                            title=f"Distribution — {dist_col}", template=TPL,
+                            color_discrete_sequence=COLORS, hole=0.3)
+                st.plotly_chart(std_layout(fig), use_container_width=True)
 
-              st.plotly_chart(std_layout(fig, h=480), use_container_width=True)
+        # ═══════════════════════════════════════════════════════════════
+        # 2️⃣ COMPARISON
+        # ═══════════════════════════════════════════════════════════════
+        elif "Comparison" in active_section:
+            st.markdown("#### 2️⃣ Comparison")
+            c1,c2,c3 = st.columns(3)
+            with c1:
+                cmp_grp   = st.selectbox("Group by (X)", cat_cols if cat_cols else all_cols, key="cmp_grp")
+                cmp_val   = st.selectbox("Value (Y)", ["Row Count"]+num_cols, key="cmp_val")
+                cmp_agg   = st.selectbox("Aggregation", ["Count","Sum","Mean","Median","Max","Min","Std"], key="cmp_agg")
+            with c2:
+                cmp_chart = st.selectbox("Chart type", ["Vertical Bar","Horizontal Bar","Grouped Bar","Lollipop","Waterfall","Bullet"], key="cmp_chart")
+                cmp_color = st.selectbox("Color by", ["None"]+cat_cols, key="cmp_color")
+                cmp_topn  = st.slider("Top N", 5, 50, 20, key="cmp_topn")
+            with c3:
+                cmp_sort  = st.radio("Sort", ["Descending","Ascending","Alphabetical"], key="cmp_sort")
+                cmp_pal   = st.selectbox("Palette", PALETTES, key="cmp_pal")
+                show_vals = st.checkbox("Show values on bars", True, key="cmp_showval")
 
-      # ═══════════════════════════════════════════════════════════════
-      # 4️⃣ COMPOSITION
-      # ═══════════════════════════════════════════════════════════════
-      elif "Composition" in active_section:
-          st.markdown("#### 4️⃣ Composition")
-          p1,p2,p3 = st.columns(3)
-          with p1:
-              comp_grp  = st.selectbox("Primary group", cat_cols if cat_cols else all_cols, key="comp_grp")
-              comp_val  = st.selectbox("Value", ["Row Count"]+num_cols, key="comp_val")
-              comp_agg  = st.selectbox("Aggregation", ["Count","Sum","Mean"], key="comp_agg")
-          with p2:
-              comp_type = st.selectbox("Chart type", ["Pie","Donut","Sunburst","Treemap","Funnel","Stacked Bar","100% Stacked Bar"], key="comp_type")
-              comp_sub  = st.selectbox("Sub-group (Sunburst/Treemap)", ["None"]+cat_cols, key="comp_sub")
-          with p3:
-              comp_topn = st.slider("Top N", 3, 30, 10, key="comp_topn")
-              comp_pal  = st.selectbox("Palette", PALETTES, key="comp_pal")
+            agg_map = {"Count":"count","Sum":"sum","Mean":"mean","Median":"median","Max":"max","Min":"min","Std":"std"}
+            if cmp_val == "Row Count":
+                cmp_df = df[cmp_grp].fillna("(blank)").astype(str).value_counts().head(cmp_topn).reset_index()
+                cmp_df.columns=[cmp_grp,"Value"]
+                y_label = "Count"
+            else:
+                cmp_df = (df.groupby(df[cmp_grp].fillna("(blank)").astype(str))[cmp_val]
+                    .agg(agg_map[cmp_agg]).round(2).reset_index())
+                cmp_df.columns=[cmp_grp,"Value"]
+                y_label = f"{cmp_agg} of {cmp_val}"
 
-          agg_map2 = {"Count":"count","Sum":"sum","Mean":"mean"}
-          if comp_val == "Row Count":
-              base = df[comp_grp].fillna("(blank)").astype(str).value_counts().head(comp_topn).reset_index()
-              base.columns=[comp_grp,"Value"]
-          else:
-              base = (df.groupby(df[comp_grp].fillna("(blank)").astype(str))[comp_val]
-                  .agg(agg_map2[comp_agg]).round(2).reset_index()
-                  .sort_values(comp_val, ascending=False).head(comp_topn))
-              base.columns=[comp_grp,"Value"]
+            if cmp_sort == "Descending":
+                cmp_df = cmp_df.sort_values("Value", ascending=False).head(cmp_topn)
+            elif cmp_sort == "Ascending":
+                cmp_df = cmp_df.sort_values("Value", ascending=True).head(cmp_topn)
+            else:
+                cmp_df = cmp_df.sort_values(cmp_grp).head(cmp_topn)
 
-          title4 = f"{comp_agg} of {comp_val} by {comp_grp}" if comp_val!="Row Count" else f"Count by {comp_grp}"
+            color_arg = cmp_color if cmp_color != "None" else None
 
-          if comp_type == "Pie":
-              fig = px.pie(base, names=comp_grp, values="Value", title=title4, template=TPL,
-                  color_discrete_sequence=COLORS)
-          elif comp_type == "Donut":
-              fig = px.pie(base, names=comp_grp, values="Value", title=title4, template=TPL,
-                  hole=0.45, color_discrete_sequence=COLORS)
-          elif comp_type == "Sunburst":
-              if comp_sub != "None" and comp_sub in df.columns:
-                  sun_df = df[[comp_grp, comp_sub]].fillna("(blank)").astype(str)
-                  sun_df["Value"] = 1
-                  if comp_val != "Row Count":
-                      sun_df["Value"] = df[comp_val].fillna(0)
-                  fig = px.sunburst(sun_df, path=[comp_grp, comp_sub], values="Value",
-                      title=f"Sunburst: {comp_grp} → {comp_sub}", template=TPL,
-                      color_discrete_sequence=COLORS)
-              else:
-                  fig = px.sunburst(base, path=[comp_grp], values="Value",
-                      title=title4, template=TPL, color_discrete_sequence=COLORS)
-          elif comp_type == "Treemap":
-              if comp_sub != "None" and comp_sub in df.columns:
-                  tm_df = df[[comp_grp, comp_sub]].fillna("(blank)").astype(str)
-                  tm_df["Value"] = 1
-                  if comp_val != "Row Count":
-                      tm_df["Value"] = df[comp_val].fillna(0)
-                  fig = px.treemap(tm_df, path=[comp_grp, comp_sub], values="Value",
-                      title=f"Treemap: {comp_grp} → {comp_sub}",
-                      color_continuous_scale=comp_pal)
-              else:
-                  fig = px.treemap(base, path=[comp_grp], values="Value",
-                      title=title4, color_continuous_scale=comp_pal)
-          elif comp_type == "Funnel":
-              fig = px.funnel(base.sort_values("Value", ascending=False),
-                  x="Value", y=comp_grp, title=title4, template=TPL,
-                  color_discrete_sequence=COLORS)
-          elif comp_type == "Stacked Bar":
-              if comp_sub != "None" and comp_sub in df.columns:
-                  sb_df = df.groupby([comp_grp, comp_sub]).size().reset_index(name="Value")
-                  fig = px.bar(sb_df, x=comp_grp, y="Value", color=comp_sub,
-                      barmode="stack", template=TPL, title=f"Stacked: {comp_grp} by {comp_sub}",
-                      color_discrete_sequence=COLORS)
-                  fig.update_xaxes(tickangle=-35)
-              else:
-                  fig = px.bar(base, x=comp_grp, y="Value", color=comp_grp,
-                      template=TPL, title=title4, color_discrete_sequence=COLORS)
-          else:  # 100% Stacked
-              if comp_sub != "None" and comp_sub in df.columns:
-                  sb_df = df.groupby([comp_grp, comp_sub]).size().reset_index(name="Value")
-                  fig = px.bar(sb_df, x=comp_grp, y="Value", color=comp_sub,
-                      barmode="relative", template=TPL,
-                      title=f"100% Stacked: {comp_grp} by {comp_sub}",
-                      color_discrete_sequence=COLORS)
-                  fig.update_xaxes(tickangle=-35)
-              else:
-                  st.warning("Select a Sub-group for 100% Stacked Bar.")
-                  fig = px.bar(base, x=comp_grp, y="Value", template=TPL)
+            if cmp_chart == "Vertical Bar":
+                fig = px.bar(cmp_df, x=cmp_grp, y="Value", color=cmp_grp if not color_arg else color_arg,
+                    color_discrete_sequence=COLORS, color_continuous_scale=cmp_pal,
+                    title=f"{y_label} by {cmp_grp}", template=TPL, text_auto=show_vals)
+                fig.update_xaxes(tickangle=-35)
+            elif cmp_chart == "Horizontal Bar":
+                fig = px.bar(cmp_df, y=cmp_grp, x="Value", orientation="h",
+                    color="Value", color_continuous_scale=cmp_pal,
+                    title=f"{y_label} by {cmp_grp}", template=TPL, text_auto=show_vals)
+            elif cmp_chart == "Grouped Bar":
+                if color_arg and color_arg in df.columns:
+                    sub = df.groupby([cmp_grp, color_arg])[cmp_val if cmp_val!="Row Count" else cmp_grp].agg(
+                        agg_map[cmp_agg] if cmp_val!="Row Count" else "count").round(2).reset_index()
+                    sub.columns = [cmp_grp, color_arg, "Value"]
+                    fig = px.bar(sub, x=cmp_grp, y="Value", color=color_arg,
+                        barmode="group", template=TPL, color_discrete_sequence=COLORS,
+                        title=f"Grouped — {y_label} by {cmp_grp} & {color_arg}", text_auto=show_vals)
+                    fig.update_xaxes(tickangle=-35)
+                else:
+                    st.warning("Select a 'Color by' column for grouped bar.")
+                    fig = px.bar(cmp_df, x=cmp_grp, y="Value", template=TPL)
+            elif cmp_chart == "Lollipop":
+                fig = go.Figure()
+                for _, row in cmp_df.iterrows():
+                    fig.add_shape(type="line", x0=row[cmp_grp], x1=row[cmp_grp], y0=0, y1=row["Value"],
+                        line=dict(color="#3b82f6", width=2))
+                fig.add_trace(go.Scatter(x=cmp_df[cmp_grp], y=cmp_df["Value"],
+                    mode="markers+text" if show_vals else "markers",
+                    marker=dict(size=12, color="#3b82f6"),
+                    text=cmp_df["Value"].round(1) if show_vals else None,
+                    textposition="top center"))
+                fig.update_layout(title=f"{y_label} by {cmp_grp}", template=TPL,
+                    xaxis_tickangle=-35)
+            elif cmp_chart == "Waterfall":
+                fig = go.Figure(go.Waterfall(
+                    name="value", orientation="v",
+                    x=cmp_df[cmp_grp].tolist(),
+                    y=cmp_df["Value"].tolist(),
+                    connector={"line":{"color":"#94a3b8"}},
+                ))
+                fig.update_layout(title=f"Waterfall — {y_label}", template=TPL)
+            else:  # Bullet
+                fig = go.Figure()
+                max_v = cmp_df["Value"].max()
+                for i, row in cmp_df.iterrows():
+                    fig.add_trace(go.Indicator(
+                        mode="number+gauge", value=row["Value"],
+                        domain={"x":[0,1],"y":[(i)/len(cmp_df),(i+0.85)/len(cmp_df)]},
+                        title={"text": str(row[cmp_grp])[:20]},
+                        gauge={"axis":{"range":[0,max_v]},
+                               "bar":{"color":"#3b82f6"},
+                               "bgcolor":"#e2e8f0"}
+                    ))
+                fig.update_layout(title=f"Bullet — {y_label}", height=max(400, len(cmp_df)*60))
 
-          st.plotly_chart(std_layout(fig, h=460), use_container_width=True)
+            st.plotly_chart(std_layout(fig), use_container_width=True)
 
-      # ═══════════════════════════════════════════════════════════════
-      # 5️⃣ TIME SERIES
-      # ═══════════════════════════════════════════════════════════════
-      elif "Time Series" in active_section:
-          st.markdown("#### 5️⃣ Time Series")
-          if not date_cols:
-              st.info("No date/time columns detected. Columns with 'date','time','month','year' in name are auto-detected.")
-          elif not num_cols:
-              st.info("No numeric columns found.")
-          else:
-              t1,t2,t3 = st.columns(3)
-              with t1:
-                  ts_date  = st.selectbox("Date column", date_cols, key="ts_date2")
-                  ts_val   = st.selectbox("Value column", num_cols, key="ts_val2")
-                  ts_grp   = st.selectbox("Group by", ["None"]+cat_cols, key="ts_grp")
-              with t2:
-                  ts_freq  = st.selectbox("Resample", ["None","Day","Week","Month","Quarter","Year"], key="ts_freq2")
-                  ts_agg   = st.selectbox("Aggregation", ["Sum","Mean","Count","Max","Min"], key="ts_agg2")
-                  ts_type  = st.selectbox("Chart type", ["Line","Area","Bar","Scatter","Step"], key="ts_type")
-              with t3:
-                  ts_roll  = st.slider("Rolling average (0=off)", 0, 30, 0, key="ts_roll")
-                  ts_annot = st.checkbox("Annotate max/min", True, key="ts_annot")
+        # ═══════════════════════════════════════════════════════════════
+        # 3️⃣ RELATIONSHIP / SCATTER
+        # ═══════════════════════════════════════════════════════════════
+        elif "Relationship" in active_section:
+            st.markdown("#### 3️⃣ Relationship / Scatter")
+            if len(num_cols) < 2:
+                st.info("Need at least 2 numeric columns.")
+            else:
+                r1,r2,r3,r4 = st.columns(4)
+                with r1:
+                    rx = st.selectbox("X axis", num_cols, index=0, key="rx")
+                    ry = st.selectbox("Y axis", num_cols, index=min(1,len(num_cols)-1), key="ry")
+                with r2:
+                    rcolor = st.selectbox("Color by", ["None"]+cat_cols+num_cols, key="rcolor")
+                    rsize  = st.selectbox("Size by", ["None"]+num_cols, key="rsize")
+                with r3:
+                    rstype = st.selectbox("Chart", ["Scatter","Bubble","Density Contour","Density Heatmap","Line"], key="rstype")
+                    rtrendline = st.selectbox("Trendline", ["None","OLS","Lowess"], key="rtl")
+                with r4:
+                    rfacet = st.selectbox("Facet by (small multiples)", ["None"]+cat_cols, key="rfacet")
+                    rsample = st.slider("Max points", 100, 5000, 2000, 100, key="rsample")
 
-              try:
-                  ts_df = df[[ts_date, ts_val] + ([ts_grp] if ts_grp!="None" else [])].copy()
-                  ts_df[ts_date] = pd.to_datetime(ts_df[ts_date], errors="coerce")
-                  ts_df = ts_df.dropna(subset=[ts_date])
+                plot_df = df.sample(min(rsample, len(df)))
+                kw = dict(data_frame=plot_df, x=rx, y=ry, template=TPL, opacity=0.65,
+                    title=f"{rx} vs {ry}")
+                if rcolor != "None": kw["color"] = rcolor
+                if rfacet != "None": kw["facet_col"] = rfacet; kw["facet_col_wrap"] = 3
+                tl_map = {"OLS":"ols","Lowess":"lowess","None":None}
+                tl = tl_map[rtrendline]
 
-                  freq_map2 = {"Day":"D","Week":"W","Month":"ME","Quarter":"QE","Year":"YE"}
-                  agg_fn = ts_agg.lower()
+                if rstype == "Scatter":
+                    if tl: kw["trendline"] = tl
+                    fig = px.scatter(**kw, color_discrete_sequence=COLORS)
+                elif rstype == "Bubble":
+                    if rsize != "None":
+                        kw["size"] = rsize; kw["size_max"] = 25
+                    fig = px.scatter(**kw, color_discrete_sequence=COLORS)
+                elif rstype == "Density Contour":
+                    fig = px.density_contour(**kw, color_discrete_sequence=COLORS)
+                    fig.update_traces(contours_coloring="fill", contours_showlabels=True)
+                elif rstype == "Density Heatmap":
+                    fig = px.density_heatmap(plot_df, x=rx, y=ry, nbinsx=30, nbinsy=30,
+                        color_continuous_scale="Blues", template=TPL, title=f"{rx} vs {ry}")
+                else:  # Line
+                    ldf = df[[rx,ry]].dropna().sort_values(rx)
+                    fig = px.line(ldf, x=rx, y=ry, template=TPL, title=f"{ry} vs {rx}",
+                        color_discrete_sequence=["#3b82f6"])
 
-                  if ts_grp != "None":
-                      if ts_freq != "None":
-                          ts_df = ts_df.set_index(ts_date)
-                          ts_df = ts_df.groupby(ts_grp).resample(freq_map2[ts_freq])[ts_val].agg(agg_fn).reset_index()
-                      plot_kw = dict(data_frame=ts_df, x=ts_date, y=ts_val, color=ts_grp,
-                          template=TPL, title=f"{ts_val} over Time by {ts_grp}",
-                          color_discrete_sequence=COLORS)
-                  else:
-                      ts_df = ts_df[[ts_date, ts_val]].sort_values(ts_date)
-                      if ts_freq != "None":
-                          ts_df = ts_df.set_index(ts_date).resample(freq_map2[ts_freq])[ts_val].agg(agg_fn).reset_index()
-                      if ts_roll > 0:
-                          ts_df[f"Rolling {ts_roll}"] = ts_df[ts_val].rolling(ts_roll).mean()
-                      plot_kw = dict(data_frame=ts_df, x=ts_date, y=ts_val,
-                          template=TPL, title=f"{ts_agg} of {ts_val} over Time",
-                          color_discrete_sequence=["#3b82f6"])
+                st.plotly_chart(std_layout(fig, h=480), use_container_width=True)
 
-                  if ts_type == "Line":
-                      fig = px.line(**plot_kw)
-                      fig.update_traces(line_width=2)
-                  elif ts_type == "Area":
-                      fig = px.area(**plot_kw)
-                  elif ts_type == "Bar":
-                      fig = px.bar(**plot_kw)
-                  elif ts_type == "Scatter":
-                      fig = px.scatter(**plot_kw)
-                  else:  # Step
-                      fig = px.line(**plot_kw, line_shape="hv")
+        # ═══════════════════════════════════════════════════════════════
+        # 4️⃣ COMPOSITION
+        # ═══════════════════════════════════════════════════════════════
+        elif "Composition" in active_section:
+            st.markdown("#### 4️⃣ Composition")
+            p1,p2,p3 = st.columns(3)
+            with p1:
+                comp_grp  = st.selectbox("Primary group", cat_cols if cat_cols else all_cols, key="comp_grp")
+                comp_val  = st.selectbox("Value", ["Row Count"]+num_cols, key="comp_val")
+                comp_agg  = st.selectbox("Aggregation", ["Count","Sum","Mean"], key="comp_agg")
+            with p2:
+                comp_type = st.selectbox("Chart type", ["Pie","Donut","Sunburst","Treemap","Funnel","Stacked Bar","100% Stacked Bar"], key="comp_type")
+                comp_sub  = st.selectbox("Sub-group (Sunburst/Treemap)", ["None"]+cat_cols, key="comp_sub")
+            with p3:
+                comp_topn = st.slider("Top N", 3, 30, 10, key="comp_topn")
+                comp_pal  = st.selectbox("Palette", PALETTES, key="comp_pal")
 
-                  # Rolling avg overlay
-                  if ts_roll > 0 and ts_grp == "None" and f"Rolling {ts_roll}" in ts_df.columns:
-                      fig.add_scatter(x=ts_df[ts_date], y=ts_df[f"Rolling {ts_roll}"],
-                          mode="lines", name=f"{ts_roll}-period avg",
-                          line=dict(color="red", dash="dash", width=2))
+            agg_map2 = {"Count":"count","Sum":"sum","Mean":"mean"}
+            if comp_val == "Row Count":
+                base = df[comp_grp].fillna("(blank)").astype(str).value_counts().head(comp_topn).reset_index()
+                base.columns=[comp_grp,"Value"]
+            else:
+                base = (df.groupby(df[comp_grp].fillna("(blank)").astype(str))[comp_val]
+                    .agg(agg_map2[comp_agg]).round(2).reset_index()
+                    .sort_values(comp_val, ascending=False).head(comp_topn))
+                base.columns=[comp_grp,"Value"]
 
-                  # Annotate max/min
-                  if ts_annot and ts_grp == "None":
-                      max_row = ts_df.loc[ts_df[ts_val].idxmax()]
-                      min_row = ts_df.loc[ts_df[ts_val].idxmin()]
-                      fig.add_annotation(x=max_row[ts_date], y=max_row[ts_val],
-                          text=f"Max: {max_row[ts_val]:.1f}", showarrow=True, arrowhead=2,
-                          bgcolor="white", bordercolor="#3b82f6")
-                      fig.add_annotation(x=min_row[ts_date], y=min_row[ts_val],
-                          text=f"Min: {min_row[ts_val]:.1f}", showarrow=True, arrowhead=2,
-                          bgcolor="white", bordercolor="#ef4444")
+            title4 = f"{comp_agg} of {comp_val} by {comp_grp}" if comp_val!="Row Count" else f"Count by {comp_grp}"
 
-                  st.plotly_chart(std_layout(fig, h=450), use_container_width=True)
-              except Exception as e:
-                  st.error(f"Time series error: {e}")
+            if comp_type == "Pie":
+                fig = px.pie(base, names=comp_grp, values="Value", title=title4, template=TPL,
+                    color_discrete_sequence=COLORS)
+            elif comp_type == "Donut":
+                fig = px.pie(base, names=comp_grp, values="Value", title=title4, template=TPL,
+                    hole=0.45, color_discrete_sequence=COLORS)
+            elif comp_type == "Sunburst":
+                if comp_sub != "None" and comp_sub in df.columns:
+                    sun_df = df[[comp_grp, comp_sub]].fillna("(blank)").astype(str)
+                    sun_df["Value"] = 1
+                    if comp_val != "Row Count":
+                        sun_df["Value"] = df[comp_val].fillna(0)
+                    fig = px.sunburst(sun_df, path=[comp_grp, comp_sub], values="Value",
+                        title=f"Sunburst: {comp_grp} → {comp_sub}", template=TPL,
+                        color_discrete_sequence=COLORS)
+                else:
+                    fig = px.sunburst(base, path=[comp_grp], values="Value",
+                        title=title4, template=TPL, color_discrete_sequence=COLORS)
+            elif comp_type == "Treemap":
+                if comp_sub != "None" and comp_sub in df.columns:
+                    tm_df = df[[comp_grp, comp_sub]].fillna("(blank)").astype(str)
+                    tm_df["Value"] = 1
+                    if comp_val != "Row Count":
+                        tm_df["Value"] = df[comp_val].fillna(0)
+                    fig = px.treemap(tm_df, path=[comp_grp, comp_sub], values="Value",
+                        title=f"Treemap: {comp_grp} → {comp_sub}",
+                        color_continuous_scale=comp_pal)
+                else:
+                    fig = px.treemap(base, path=[comp_grp], values="Value",
+                        title=title4, color_continuous_scale=comp_pal)
+            elif comp_type == "Funnel":
+                fig = px.funnel(base.sort_values("Value", ascending=False),
+                    x="Value", y=comp_grp, title=title4, template=TPL,
+                    color_discrete_sequence=COLORS)
+            elif comp_type == "Stacked Bar":
+                if comp_sub != "None" and comp_sub in df.columns:
+                    sb_df = df.groupby([comp_grp, comp_sub]).size().reset_index(name="Value")
+                    fig = px.bar(sb_df, x=comp_grp, y="Value", color=comp_sub,
+                        barmode="stack", template=TPL, title=f"Stacked: {comp_grp} by {comp_sub}",
+                        color_discrete_sequence=COLORS)
+                    fig.update_xaxes(tickangle=-35)
+                else:
+                    fig = px.bar(base, x=comp_grp, y="Value", color=comp_grp,
+                        template=TPL, title=title4, color_discrete_sequence=COLORS)
+            else:  # 100% Stacked
+                if comp_sub != "None" and comp_sub in df.columns:
+                    sb_df = df.groupby([comp_grp, comp_sub]).size().reset_index(name="Value")
+                    fig = px.bar(sb_df, x=comp_grp, y="Value", color=comp_sub,
+                        barmode="relative", template=TPL,
+                        title=f"100% Stacked: {comp_grp} by {comp_sub}",
+                        color_discrete_sequence=COLORS)
+                    fig.update_xaxes(tickangle=-35)
+                else:
+                    st.warning("Select a Sub-group for 100% Stacked Bar.")
+                    fig = px.bar(base, x=comp_grp, y="Value", template=TPL)
 
-      # ═══════════════════════════════════════════════════════════════
-      # 6️⃣ RANKING
-      # ═══════════════════════════════════════════════════════════════
-      elif "Ranking" in active_section:
-          st.markdown("#### 6️⃣ Ranking")
-          rk1,rk2 = st.columns(2)
-          with rk1:
-              rk_grp  = st.selectbox("Rank by category", cat_cols if cat_cols else all_cols, key="rk_grp")
-              rk_val  = st.selectbox("Value", ["Row Count"]+num_cols, key="rk_val")
-              rk_agg  = st.selectbox("Aggregation", ["Count","Sum","Mean","Median","Max"], key="rk_agg")
-          with rk2:
-              rk_n    = st.slider("Top / Bottom N", 3, 50, 15, key="rk_n")
-              rk_show = st.radio("Show", ["Top N","Bottom N","Both"], key="rk_show")
-              rk_pal  = st.selectbox("Palette", PALETTES, key="rk_pal")
+            st.plotly_chart(std_layout(fig, h=460), use_container_width=True)
 
-          agg_fn3 = {"Count":"count","Sum":"sum","Mean":"mean","Median":"median","Max":"max"}
-          if rk_val == "Row Count":
-              full_rank = df[rk_grp].fillna("(blank)").astype(str).value_counts().reset_index()
-              full_rank.columns=[rk_grp,"Value"]
-          else:
-              full_rank = (df.groupby(df[rk_grp].fillna("(blank)").astype(str))[rk_val]
-                  .agg(agg_fn3[rk_agg]).round(2).reset_index().sort_values(rk_val, ascending=False))
-              full_rank.columns=[rk_grp,"Value"]
+        # ═══════════════════════════════════════════════════════════════
+        # 5️⃣ TIME SERIES
+        # ═══════════════════════════════════════════════════════════════
+        elif "Time Series" in active_section:
+            st.markdown("#### 5️⃣ Time Series")
+            if not date_cols:
+                st.info("No date/time columns detected. Columns with 'date','time','month','year' in name are auto-detected.")
+            elif not num_cols:
+                st.info("No numeric columns found.")
+            else:
+                t1,t2,t3 = st.columns(3)
+                with t1:
+                    ts_date  = st.selectbox("Date column", date_cols, key="ts_date2")
+                    ts_val   = st.selectbox("Value column", num_cols, key="ts_val2")
+                    ts_grp   = st.selectbox("Group by", ["None"]+cat_cols, key="ts_grp")
+                with t2:
+                    ts_freq  = st.selectbox("Resample", ["None","Day","Week","Month","Quarter","Year"], key="ts_freq2")
+                    ts_agg   = st.selectbox("Aggregation", ["Sum","Mean","Count","Max","Min"], key="ts_agg2")
+                    ts_type  = st.selectbox("Chart type", ["Line","Area","Bar","Scatter","Step"], key="ts_type")
+                with t3:
+                    ts_roll  = st.slider("Rolling average (0=off)", 0, 30, 0, key="ts_roll")
+                    ts_annot = st.checkbox("Annotate max/min", True, key="ts_annot")
 
-          full_rank = full_rank.sort_values("Value", ascending=False)
-          if rk_show == "Top N":
-              rk_df = full_rank.head(rk_n)
-              rk_df["Rank"] = range(1, len(rk_df)+1)
-              title6 = f"Top {rk_n}"
-          elif rk_show == "Bottom N":
-              rk_df = full_rank.tail(rk_n).sort_values("Value")
-              rk_df["Rank"] = range(len(full_rank)-len(rk_df)+1, len(full_rank)+1)
-              title6 = f"Bottom {rk_n}"
-          else:
-              top = full_rank.head(rk_n).copy(); top["Group"]="Top"
-              bot = full_rank.tail(rk_n).sort_values("Value").copy(); bot["Group"]="Bottom"
-              rk_df = pd.concat([top, bot])
-              title6 = f"Top & Bottom {rk_n}"
+                try:
+                    ts_df = df[[ts_date, ts_val] + ([ts_grp] if ts_grp!="None" else [])].copy()
+                    ts_df[ts_date] = pd.to_datetime(ts_df[ts_date], errors="coerce")
+                    ts_df = ts_df.dropna(subset=[ts_date])
 
-          fig = px.bar(rk_df, y=rk_grp, x="Value", orientation="h",
-              color="Value", color_continuous_scale=rk_pal,
-              title=f"{title6} — {rk_agg} of {rk_val} by {rk_grp}", template=TPL,
-              text_auto=True)
-          fig.update_yaxes(categoryorder="total ascending")
-          st.plotly_chart(std_layout(fig, h=max(400, rk_n*28)), use_container_width=True)
+                    freq_map2 = {"Day":"D","Week":"W","Month":"ME","Quarter":"QE","Year":"YE"}
+                    agg_fn = ts_agg.lower()
 
-      # ═══════════════════════════════════════════════════════════════
-      # 7️⃣ CORRELATION
-      # ═══════════════════════════════════════════════════════════════
-      elif "Correlation" in active_section:
-          st.markdown("#### 7️⃣ Correlation")
-          corr_options = ["Heatmap"]
-          if SCIPY_OK:
-              corr_options.append("Clustermap")
-          corr_options.append("Bar (top pairs)")
-          corr_type = st.selectbox("Chart", corr_options, key="corr_type")
+                    if ts_grp != "None":
+                        if ts_freq != "None":
+                            ts_df = ts_df.set_index(ts_date)
+                            ts_df = ts_df.groupby(ts_grp).resample(freq_map2[ts_freq])[ts_val].agg(agg_fn).reset_index()
+                        plot_kw = dict(data_frame=ts_df, x=ts_date, y=ts_val, color=ts_grp,
+                            template=TPL, title=f"{ts_val} over Time by {ts_grp}",
+                            color_discrete_sequence=COLORS)
+                    else:
+                        ts_df = ts_df[[ts_date, ts_val]].sort_values(ts_date)
+                        if ts_freq != "None":
+                            ts_df = ts_df.set_index(ts_date).resample(freq_map2[ts_freq])[ts_val].agg(agg_fn).reset_index()
+                        if ts_roll > 0:
+                            ts_df[f"Rolling {ts_roll}"] = ts_df[ts_val].rolling(ts_roll).mean()
+                        plot_kw = dict(data_frame=ts_df, x=ts_date, y=ts_val,
+                            template=TPL, title=f"{ts_agg} of {ts_val} over Time",
+                            color_discrete_sequence=["#3b82f6"])
 
-          if len(num_cols) < 2:
-              st.info("Select at least 2 numeric columns to view correlation charts.")
-              corr_cols = num_cols
-              corr_meth = "pearson"
-              corr_pal = "RdBu"
-          else:
-              cr1, cr2 = st.columns(2)
-              with cr1:
-                  corr_cols = st.multiselect("Columns to include", num_cols, default=num_cols[:min(8, len(num_cols))], key="corr_cols")
-                  corr_meth = st.selectbox("Method", ["pearson", "spearman", "kendall"], key="corr_meth")
-              with cr2:
-                  corr_pal = st.selectbox("Palette", ["RdBu", "RdYlGn", "Viridis", "Plasma", "Blues"], key="corr_pal")
+                    if ts_type == "Line":
+                        fig = px.line(**plot_kw)
+                        fig.update_traces(line_width=2)
+                    elif ts_type == "Area":
+                        fig = px.area(**plot_kw)
+                    elif ts_type == "Bar":
+                        fig = px.bar(**plot_kw)
+                    elif ts_type == "Scatter":
+                        fig = px.scatter(**plot_kw)
+                    else:  # Step
+                        fig = px.line(**plot_kw, line_shape="hv")
 
-              if len(corr_cols) >= 2:
-                  corr = df[corr_cols].corr(method=corr_meth).round(3)
-                  if corr_type == "Heatmap":
-                      fig = go.Figure(go.Heatmap(
-                          z=corr.values, x=corr.columns.tolist(), y=corr.columns.tolist(),
-                          colorscale=corr_pal, zmid=0,
-                          text=corr.values.round(2), texttemplate="%{text}",
-                          textfont={"size":11}, hoverongaps=False,
-                      ))
-                      fig.update_layout(title=f"{corr_meth.title()} Correlation Heatmap", template=TPL,
-                          height=max(380, len(corr_cols)*50))
-                  elif corr_type == "Clustermap":
-                      if SCIPY_OK:
-                          dist = 1 - corr.abs()
-                          dist = dist.clip(lower=0)
-                          np.fill_diagonal(dist.values, 0)
-                          try:
-                              link = linkage(squareform(dist.values), method="ward")
-                              order = leaves_list(link)
-                              corr_r = corr.iloc[order, order]
-                              title = "Clustered Correlation Heatmap"
-                          except Exception:
-                              corr_r = corr
-                              title = "Clustered Correlation Heatmap"
-                      else:
-                          corr_r = corr
-                          title = "Correlation Heatmap"
-                          st.warning("Scipy is required for clustermap. Install scipy or choose another chart.")
-                      fig = go.Figure(go.Heatmap(
-                          z=corr_r.values, x=corr_r.columns.tolist(), y=corr_r.columns.tolist(),
-                          colorscale=corr_pal, zmid=0,
-                          text=corr_r.values.round(2), texttemplate="%{text}",
-                      ))
-                      fig.update_layout(title=title, template=TPL,
-                          height=max(380, len(corr_cols)*50))
-                  else:  # Bar top pairs
-                      pairs = []
-                      cols_list = corr_cols
-                      for i in range(len(cols_list)):
-                          for j in range(i+1, len(cols_list)):
-                              pairs.append({"Pair": f"{cols_list[i]} × {cols_list[j]}",
-                                  "Correlation": corr.loc[cols_list[i], cols_list[j]]})
-                      pairs_df = pd.DataFrame(pairs).sort_values("Correlation", key=abs, ascending=False)
-                      fig = px.bar(pairs_df, x="Pair", y="Correlation",
-                          color="Correlation", color_continuous_scale="RdBu",
-                          title=f"Top Correlations ({corr_meth})", template=TPL)
-                      fig.update_xaxes(tickangle=-45)
-                      fig.add_hline(y=0, line_dash="dash", line_color="gray")
+                    # Rolling avg overlay
+                    if ts_roll > 0 and ts_grp == "None" and f"Rolling {ts_roll}" in ts_df.columns:
+                        fig.add_scatter(x=ts_df[ts_date], y=ts_df[f"Rolling {ts_roll}"],
+                            mode="lines", name=f"{ts_roll}-period avg",
+                            line=dict(color="red", dash="dash", width=2))
 
-                  st.plotly_chart(std_layout(fig), use_container_width=True)
-              else:
-                  st.info("Select at least 2 columns.")
+                    # Annotate max/min
+                    if ts_annot and ts_grp == "None":
+                        max_row = ts_df.loc[ts_df[ts_val].idxmax()]
+                        min_row = ts_df.loc[ts_df[ts_val].idxmin()]
+                        fig.add_annotation(x=max_row[ts_date], y=max_row[ts_val],
+                            text=f"Max: {max_row[ts_val]:.1f}", showarrow=True, arrowhead=2,
+                            bgcolor="white", bordercolor="#3b82f6")
+                        fig.add_annotation(x=min_row[ts_date], y=min_row[ts_val],
+                            text=f"Min: {min_row[ts_val]:.1f}", showarrow=True, arrowhead=2,
+                            bgcolor="white", bordercolor="#ef4444")
 
-      # ═══════════════════════════════════════════════════════════════
-      # 8️⃣ MULTI-GROUP COMPARISON
-      # ═══════════════════════════════════════════════════════════════
-      elif "Multi-Group" in active_section:
-          st.markdown("#### 8️⃣ Multi-Group Comparison")
-          mg1,mg2 = st.columns(2)
-          with mg1:
-              mg_x   = st.selectbox("X (primary group)", cat_cols if cat_cols else all_cols, key="mg_x")
-              mg_col = st.selectbox("Color group", ["None"]+cat_cols, key="mg_col")
-              mg_val = st.selectbox("Value", ["Row Count"]+num_cols, key="mg_val")
-              mg_agg = st.selectbox("Aggregation", ["Count","Sum","Mean","Median"], key="mg_agg")
-          with mg2:
-              mg_type= st.selectbox("Chart type", ["Grouped Bar","Stacked Bar","100% Stacked","Heatmap Table","Radar","Parallel Categories"], key="mg_type")
-              mg_topn= st.slider("Top N per group", 3, 20, 8, key="mg_topn")
+                    st.plotly_chart(std_layout(fig, h=450), use_container_width=True)
+                except Exception as e:
+                    st.error(f"Time series error: {e}")
 
-          agg_fn4 = {"Count":"count","Sum":"sum","Mean":"mean","Median":"median"}
-          if mg_val == "Row Count":
-              if mg_col != "None" and mg_col in df.columns:
-                  mg_df = df.groupby([mg_x, mg_col]).size().reset_index(name="Value")
-              else:
-                  mg_df = df[mg_x].value_counts().head(mg_topn).reset_index()
-                  mg_df.columns = [mg_x, "Value"]
-          else:
-              grp_list = [mg_x] + ([mg_col] if mg_col != "None" else [])
-              mg_df = df.groupby([df[c].fillna("(blank)").astype(str) for c in grp_list])[mg_val].agg(agg_fn4[mg_agg]).round(2).reset_index()
-              mg_df.columns = grp_list + ["Value"]
+        # ═══════════════════════════════════════════════════════════════
+        # 6️⃣ RANKING
+        # ═══════════════════════════════════════════════════════════════
+        elif "Ranking" in active_section:
+            st.markdown("#### 6️⃣ Ranking")
+            rk1,rk2 = st.columns(2)
+            with rk1:
+                rk_grp  = st.selectbox("Rank by category", cat_cols if cat_cols else all_cols, key="rk_grp")
+                rk_val  = st.selectbox("Value", ["Row Count"]+num_cols, key="rk_val")
+                rk_agg  = st.selectbox("Aggregation", ["Count","Sum","Mean","Median","Max"], key="rk_agg")
+            with rk2:
+                rk_n    = st.slider("Top / Bottom N", 3, 50, 15, key="rk_n")
+                rk_show = st.radio("Show", ["Top N","Bottom N","Both"], key="rk_show")
+                rk_pal  = st.selectbox("Palette", PALETTES, key="rk_pal")
 
-          color_c = mg_col if mg_col != "None" else None
-          label8 = f"{mg_agg} of {mg_val}" if mg_val != "Row Count" else "Count"
+            agg_fn3 = {"Count":"count","Sum":"sum","Mean":"mean","Median":"median","Max":"max"}
+            if rk_val == "Row Count":
+                full_rank = df[rk_grp].fillna("(blank)").astype(str).value_counts().reset_index()
+                full_rank.columns=[rk_grp,"Value"]
+            else:
+                full_rank = (df.groupby(df[rk_grp].fillna("(blank)").astype(str))[rk_val]
+                    .agg(agg_fn3[rk_agg]).round(2).reset_index().sort_values(rk_val, ascending=False))
+                full_rank.columns=[rk_grp,"Value"]
 
-          if mg_type == "Grouped Bar":
-              fig = px.bar(mg_df, x=mg_x, y="Value", color=color_c,
-                  barmode="group", template=TPL, color_discrete_sequence=COLORS,
-                  title=f"Grouped: {label8} by {mg_x}" + (f" & {mg_col}" if color_c else ""),
-                  text_auto=True)
-              fig.update_xaxes(tickangle=-35)
-          elif mg_type == "Stacked Bar":
-              fig = px.bar(mg_df, x=mg_x, y="Value", color=color_c,
-                  barmode="stack", template=TPL, color_discrete_sequence=COLORS,
-                  title=f"Stacked: {label8} by {mg_x}")
-              fig.update_xaxes(tickangle=-35)
-          elif mg_type == "100% Stacked":
-              fig = px.bar(mg_df, x=mg_x, y="Value", color=color_c,
-                  barmode="relative", template=TPL, color_discrete_sequence=COLORS,
-                  title=f"100% Stacked: {label8}")
-              fig.update_xaxes(tickangle=-35)
-          elif mg_type == "Heatmap Table":
-              if color_c:
-                  piv = mg_df.pivot_table(index=mg_x, columns=mg_col, values="Value", aggfunc="sum").fillna(0)
-                  fig = go.Figure(go.Heatmap(
-                      z=piv.values, x=piv.columns.tolist(), y=piv.index.tolist(),
-                      colorscale="Blues", text=piv.values.round(1),
-                      texttemplate="%{text}", textfont={"size":10},
-                  ))
-                  fig.update_layout(title=f"{label8}: {mg_x} × {mg_col}", template=TPL)
-              else:
-                  st.warning("Select a Color group for Heatmap Table.")
-                  fig = go.Figure()
-          elif mg_type == "Radar":
-              if color_c and color_c in df.columns:
-                  cats = mg_df[mg_x].unique().tolist()[:12]
-                  groups = mg_df[mg_col].unique().tolist()[:6]
-                  fig = go.Figure()
-                  for grp in groups:
-                      sub = mg_df[mg_df[mg_col]==grp]
-                      vals = [sub.loc[sub[mg_x]==c,"Value"].sum() for c in cats]
-                      fig.add_trace(go.Scatterpolar(r=vals+[vals[0]], theta=cats+[cats[0]],
-                          fill="toself", name=str(grp)))
-                  fig.update_layout(polar=dict(radialaxis=dict(visible=True)),
-                      title=f"Radar: {label8}", template=TPL)
-              else:
-                  st.warning("Select a Color group for Radar chart.")
-                  fig = go.Figure()
-          else:  # Parallel Categories
-              pc_cols = [mg_x] + ([mg_col] if color_c else [])
-              fig = px.parallel_categories(df[pc_cols+([mg_val] if mg_val!="Row Count" else [])].dropna().head(2000),
-                  dimensions=pc_cols, template=TPL,
-                  title=f"Parallel Categories: {' → '.join(pc_cols)}")
+            full_rank = full_rank.sort_values("Value", ascending=False)
+            if rk_show == "Top N":
+                rk_df = full_rank.head(rk_n)
+                rk_df["Rank"] = range(1, len(rk_df)+1)
+                title6 = f"Top {rk_n}"
+            elif rk_show == "Bottom N":
+                rk_df = full_rank.tail(rk_n).sort_values("Value")
+                rk_df["Rank"] = range(len(full_rank)-len(rk_df)+1, len(full_rank)+1)
+                title6 = f"Bottom {rk_n}"
+            else:
+                top = full_rank.head(rk_n).copy(); top["Group"]="Top"
+                bot = full_rank.tail(rk_n).sort_values("Value").copy(); bot["Group"]="Bottom"
+                rk_df = pd.concat([top, bot])
+                title6 = f"Top & Bottom {rk_n}"
 
-          st.plotly_chart(std_layout(fig, h=480), use_container_width=True)
+            fig = px.bar(rk_df, y=rk_grp, x="Value", orientation="h",
+                color="Value", color_continuous_scale=rk_pal,
+                title=f"{title6} — {rk_agg} of {rk_val} by {rk_grp}", template=TPL,
+                text_auto=True)
+            fig.update_yaxes(categoryorder="total ascending")
+            st.plotly_chart(std_layout(fig, h=max(400, rk_n*28)), use_container_width=True)
 
-      # ═══════════════════════════════════════════════════════════════
-      # 9️⃣ CUSTOM CHART BUILDER
-      # ═══════════════════════════════════════════════════════════════
-      elif "Custom" in active_section:
-          st.markdown("#### 9️⃣ Custom Chart Builder")
-          st.caption("Full control — pick any columns and any chart type.")
-          cu1,cu2,cu3 = st.columns(3)
-          with cu1:
-              cu_x     = st.selectbox("X axis", ["None"]+all_cols, key="cu_x")
-              cu_y     = st.selectbox("Y axis", ["None"]+all_cols, key="cu_y")
-              cu_color = st.selectbox("Color", ["None"]+all_cols, key="cu_color")
-              cu_size  = st.selectbox("Size", ["None"]+num_cols, key="cu_size")
-          with cu2:
-              cu_facet = st.selectbox("Facet column", ["None"]+cat_cols, key="cu_facet")
-              cu_facr  = st.selectbox("Facet row", ["None"]+cat_cols, key="cu_facr")
-              cu_type  = st.selectbox("Chart type", [
-                  "Bar","Horizontal Bar","Line","Area","Scatter","Bubble",
-                  "Box","Violin","Strip","Histogram","Pie","Donut",
-                  "Treemap","Sunburst","Funnel","ECDF","Density Heatmap",
-                  "Parallel Coordinates","Parallel Categories","Scatter Matrix"
-              ], key="cu_type")
-          with cu3:
-              cu_agg   = st.selectbox("Aggregate Y by X?", ["None","Sum","Mean","Count","Median","Max","Min"], key="cu_agg")
-              cu_pal   = st.selectbox("Color palette", PALETTES+["Plotly","D3","G10","T10"], key="cu_pal")
-              cu_n     = st.slider("Sample rows", 100, len(df), min(2000, len(df)), 100, key="cu_n")
-              cu_h     = st.slider("Chart height", 300, 900, 450, 50, key="cu_h")
-              cu_tl    = st.selectbox("Trendline", ["None","OLS","Lowess"], key="cu_tl")
+        # ═══════════════════════════════════════════════════════════════
+        # 7️⃣ CORRELATION
+        # ═══════════════════════════════════════════════════════════════
+        elif "Correlation" in active_section:
+            st.markdown("#### 7️⃣ Correlation")
+            corr_options = ["Heatmap"]
+            if SCIPY_OK:
+                corr_options.append("Clustermap")
+            corr_options.append("Bar (top pairs)")
+            corr_type = st.selectbox("Chart", corr_options, key="corr_type")
 
-          plot_df2 = df.sample(cu_n)
-          x_c = cu_x if cu_x != "None" else None
-          y_c = cu_y if cu_y != "None" else None
-          color_c2 = cu_color if cu_color != "None" else None
-          size_c   = cu_size if cu_size != "None" else None
-          facet_c  = cu_facet if cu_facet != "None" else None
-          facr_c   = cu_facr if cu_facr != "None" else None
+            if len(num_cols) < 2:
+                st.info("Select at least 2 numeric columns to view correlation charts.")
+                corr_cols = num_cols
+                corr_meth = "pearson"
+                corr_pal = "RdBu"
+            else:
+                cr1, cr2 = st.columns(2)
+                with cr1:
+                    corr_cols = st.multiselect("Columns to include", num_cols, default=num_cols[:min(8, len(num_cols))], key="corr_cols")
+                    corr_meth = st.selectbox("Method", ["pearson", "spearman", "kendall"], key="corr_meth")
+                with cr2:
+                    corr_pal = st.selectbox("Palette", ["RdBu", "RdYlGn", "Viridis", "Plasma", "Blues"], key="corr_pal")
 
-          # Pre-aggregate if requested
-          if cu_agg != "None" and x_c and y_c:
-              agg_fn5 = {"Sum":"sum","Mean":"mean","Count":"count","Median":"median","Max":"max","Min":"min"}
-              plot_df2 = (df.groupby(df[x_c].fillna("(blank)").astype(str))[y_c]
-                  .agg(agg_fn5[cu_agg]).round(2).reset_index())
-              plot_df2.columns = [x_c, y_c]
+                if len(corr_cols) >= 2:
+                    corr = df[corr_cols].corr(method=corr_meth).round(3)
+                    if corr_type == "Heatmap":
+                        fig = go.Figure(go.Heatmap(
+                            z=corr.values, x=corr.columns.tolist(), y=corr.columns.tolist(),
+                            colorscale=corr_pal, zmid=0,
+                            text=corr.values.round(2), texttemplate="%{text}",
+                            textfont={"size":11}, hoverongaps=False,
+                        ))
+                        fig.update_layout(title=f"{corr_meth.title()} Correlation Heatmap", template=TPL,
+                            height=max(380, len(corr_cols)*50))
+                    elif corr_type == "Clustermap":
+                        if SCIPY_OK:
+                            dist = 1 - corr.abs()
+                            dist = dist.clip(lower=0)
+                            np.fill_diagonal(dist.values, 0)
+                            try:
+                                link = linkage(squareform(dist.values), method="ward")
+                                order = leaves_list(link)
+                                corr_r = corr.iloc[order, order]
+                                title = "Clustered Correlation Heatmap"
+                            except Exception:
+                                corr_r = corr
+                                title = "Clustered Correlation Heatmap"
+                        else:
+                            corr_r = corr
+                            title = "Correlation Heatmap"
+                            st.warning("Scipy is required for clustermap. Install scipy or choose another chart.")
+                        fig = go.Figure(go.Heatmap(
+                            z=corr_r.values, x=corr_r.columns.tolist(), y=corr_r.columns.tolist(),
+                            colorscale=corr_pal, zmid=0,
+                            text=corr_r.values.round(2), texttemplate="%{text}",
+                        ))
+                        fig.update_layout(title=title, template=TPL,
+                            height=max(380, len(corr_cols)*50))
+                    else:  # Bar top pairs
+                        pairs = []
+                        cols_list = corr_cols
+                        for i in range(len(cols_list)):
+                            for j in range(i+1, len(cols_list)):
+                                pairs.append({"Pair": f"{cols_list[i]} × {cols_list[j]}",
+                                    "Correlation": corr.loc[cols_list[i], cols_list[j]]})
+                        pairs_df = pd.DataFrame(pairs).sort_values("Correlation", key=abs, ascending=False)
+                        fig = px.bar(pairs_df, x="Pair", y="Correlation",
+                            color="Correlation", color_continuous_scale="RdBu",
+                            title=f"Top Correlations ({corr_meth})", template=TPL)
+                        fig.update_xaxes(tickangle=-45)
+                        fig.add_hline(y=0, line_dash="dash", line_color="gray")
 
-          pal_map = {p: getattr(px.colors.sequential, p, COLORS) for p in PALETTES}
-          pal_map.update({"Plotly":px.colors.qualitative.Plotly,"D3":px.colors.qualitative.D3,
-                          "G10":px.colors.qualitative.G10,"T10":px.colors.qualitative.T10})
-          disc_pal = pal_map.get(cu_pal, COLORS)
-          tl_arg = {"OLS":"ols","Lowess":"lowess","None":None}[cu_tl]
+                    st.plotly_chart(std_layout(fig), use_container_width=True)
+                else:
+                    st.info("Select at least 2 columns.")
 
-          try:
-              kw2 = dict(data_frame=plot_df2, template=TPL,
-                  title=f"{cu_type}: {y_c or ''} by {x_c or ''}")
-              if x_c: kw2["x"] = x_c
-              if y_c: kw2["y"] = y_c
-              if color_c2: kw2["color"] = color_c2
-              if facet_c: kw2["facet_col"] = facet_c; kw2["facet_col_wrap"] = 3
-              if facr_c: kw2["facet_row"] = facr_c
+        # ═══════════════════════════════════════════════════════════════
+        # 8️⃣ MULTI-GROUP COMPARISON
+        # ═══════════════════════════════════════════════════════════════
+        elif "Multi-Group" in active_section:
+            st.markdown("#### 8️⃣ Multi-Group Comparison")
+            mg1,mg2 = st.columns(2)
+            with mg1:
+                mg_x   = st.selectbox("X (primary group)", cat_cols if cat_cols else all_cols, key="mg_x")
+                mg_col = st.selectbox("Color group", ["None"]+cat_cols, key="mg_col")
+                mg_val = st.selectbox("Value", ["Row Count"]+num_cols, key="mg_val")
+                mg_agg = st.selectbox("Aggregation", ["Count","Sum","Mean","Median"], key="mg_agg")
+            with mg2:
+                mg_type= st.selectbox("Chart type", ["Grouped Bar","Stacked Bar","100% Stacked","Heatmap Table","Radar","Parallel Categories"], key="mg_type")
+                mg_topn= st.slider("Top N per group", 3, 20, 8, key="mg_topn")
 
-              if cu_type == "Bar":
-                  fig = px.bar(**kw2, color_discrete_sequence=disc_pal, text_auto=True)
-                  if x_c: fig.update_xaxes(tickangle=-35)
-              elif cu_type == "Horizontal Bar":
-                  if x_c and y_c:
-                      kw2["x"], kw2["y"] = y_c, x_c
-                  fig = px.bar(**kw2, orientation="h", color_discrete_sequence=disc_pal)
-              elif cu_type == "Line":
-                  fig = px.line(**kw2, color_discrete_sequence=disc_pal)
-              elif cu_type == "Area":
-                  fig = px.area(**kw2, color_discrete_sequence=disc_pal)
-              elif cu_type in ("Scatter","Bubble"):
-                  if tl_arg: kw2["trendline"] = tl_arg
-                  if size_c and cu_type=="Bubble": kw2["size"]=size_c; kw2["size_max"]=25
-                  fig = px.scatter(**kw2, color_discrete_sequence=disc_pal, opacity=0.7)
-              elif cu_type == "Box":
-                  fig = px.box(**kw2, color_discrete_sequence=disc_pal, points="outliers")
-              elif cu_type == "Violin":
-                  fig = px.violin(**kw2, color_discrete_sequence=disc_pal, box=True)
-              elif cu_type == "Strip":
-                  fig = px.strip(**kw2, color_discrete_sequence=disc_pal)
-              elif cu_type == "Histogram":
-                  fig = px.histogram(**kw2, color_discrete_sequence=disc_pal, nbins=40, marginal="rug")
-              elif cu_type in ("Pie","Donut"):
-                  fig = px.pie(plot_df2, names=x_c, values=y_c, hole=0.4 if cu_type=="Donut" else 0,
-                      color_discrete_sequence=disc_pal, title=kw2["title"])
-              elif cu_type == "Treemap":
-                  path = [p for p in [x_c, color_c2] if p]
-                  fig = px.treemap(plot_df2, path=path, values=y_c,
-                      color_continuous_scale=cu_pal, title=kw2["title"])
-              elif cu_type == "Sunburst":
-                  path = [p for p in [x_c, color_c2] if p]
-                  fig = px.sunburst(plot_df2, path=path, values=y_c,
-                      color_discrete_sequence=disc_pal, title=kw2["title"])
-              elif cu_type == "Funnel":
-                  fig = px.funnel(**kw2, color_discrete_sequence=disc_pal)
-              elif cu_type == "ECDF":
-                  fig = px.ecdf(**kw2, color_discrete_sequence=disc_pal)
-              elif cu_type == "Density Heatmap":
-                  fig = px.density_heatmap(plot_df2, x=x_c, y=y_c,
-                      nbinsx=30, nbinsy=30, color_continuous_scale=cu_pal, title=kw2["title"])
-              elif cu_type == "Parallel Coordinates":
-                  pc_num = [c for c in [x_c,y_c,size_c] if c and pd.api.types.is_numeric_dtype(df[c])]
-                  if len(pc_num) >= 2:
-                      fig = px.parallel_coordinates(plot_df2, dimensions=pc_num,
-                          color=pc_num[0], color_continuous_scale=cu_pal, title=kw2["title"])
-                  else:
-                      st.warning("Parallel Coordinates needs numeric columns for X, Y.")
-                      fig = go.Figure()
-              elif cu_type == "Parallel Categories":
-                  pc_c = [c for c in [x_c, color_c2] if c]
-                  fig = px.parallel_categories(plot_df2, dimensions=pc_c, title=kw2["title"])
-              elif cu_type == "Scatter Matrix":
-                  sm_cols = [c for c in [x_c,y_c,size_c] if c]
-                  if len(sm_cols) < 2: sm_cols = num_cols[:4]
-                  fig = px.scatter_matrix(plot_df2, dimensions=sm_cols, color=color_c2,
-                      color_discrete_sequence=disc_pal, title=kw2["title"], opacity=0.6)
-                  fig.update_traces(diagonal_visible=False, marker=dict(size=3))
-              else:
-                  fig = go.Figure()
+            agg_fn4 = {"Count":"count","Sum":"sum","Mean":"mean","Median":"median"}
+            if mg_val == "Row Count":
+                if mg_col != "None" and mg_col in df.columns:
+                    mg_df = df.groupby([mg_x, mg_col]).size().reset_index(name="Value")
+                else:
+                    mg_df = df[mg_x].value_counts().head(mg_topn).reset_index()
+                    mg_df.columns = [mg_x, "Value"]
+            else:
+                grp_list = [mg_x] + ([mg_col] if mg_col != "None" else [])
+                mg_df = df.groupby([df[c].fillna("(blank)").astype(str) for c in grp_list])[mg_val].agg(agg_fn4[mg_agg]).round(2).reset_index()
+                mg_df.columns = grp_list + ["Value"]
 
-              st.plotly_chart(std_layout(fig, h=cu_h), use_container_width=True)
-          except Exception as e:
-              st.error(f"Chart error: {e}")
+            color_c = mg_col if mg_col != "None" else None
+            label8 = f"{mg_agg} of {mg_val}" if mg_val != "Row Count" else "Count"
 
-      # ═══════════════════════════════════════════════════════════════
-      # 🔟 MISSING DATA MAP
-      # ═══════════════════════════════════════════════════════════════
-      elif "Missing" in active_section:
-          st.markdown("#### 🔟 Missing Data Map")
-          miss_cols = st.multiselect("Columns to inspect", all_cols, default=all_cols, key="miss_cols")
-          miss_n    = st.slider("Sample rows", 50, 500, 100, key="miss_n")
+            if mg_type == "Grouped Bar":
+                fig = px.bar(mg_df, x=mg_x, y="Value", color=color_c,
+                    barmode="group", template=TPL, color_discrete_sequence=COLORS,
+                    title=f"Grouped: {label8} by {mg_x}" + (f" & {mg_col}" if color_c else ""),
+                    text_auto=True)
+                fig.update_xaxes(tickangle=-35)
+            elif mg_type == "Stacked Bar":
+                fig = px.bar(mg_df, x=mg_x, y="Value", color=color_c,
+                    barmode="stack", template=TPL, color_discrete_sequence=COLORS,
+                    title=f"Stacked: {label8} by {mg_x}")
+                fig.update_xaxes(tickangle=-35)
+            elif mg_type == "100% Stacked":
+                fig = px.bar(mg_df, x=mg_x, y="Value", color=color_c,
+                    barmode="relative", template=TPL, color_discrete_sequence=COLORS,
+                    title=f"100% Stacked: {label8}")
+                fig.update_xaxes(tickangle=-35)
+            elif mg_type == "Heatmap Table":
+                if color_c:
+                    piv = mg_df.pivot_table(index=mg_x, columns=mg_col, values="Value", aggfunc="sum").fillna(0)
+                    fig = go.Figure(go.Heatmap(
+                        z=piv.values, x=piv.columns.tolist(), y=piv.index.tolist(),
+                        colorscale="Blues", text=piv.values.round(1),
+                        texttemplate="%{text}", textfont={"size":10},
+                    ))
+                    fig.update_layout(title=f"{label8}: {mg_x} × {mg_col}", template=TPL)
+                else:
+                    st.warning("Select a Color group for Heatmap Table.")
+                    fig = go.Figure()
+            elif mg_type == "Radar":
+                if color_c and color_c in df.columns:
+                    cats = mg_df[mg_x].unique().tolist()[:12]
+                    groups = mg_df[mg_col].unique().tolist()[:6]
+                    fig = go.Figure()
+                    for grp in groups:
+                        sub = mg_df[mg_df[mg_col]==grp]
+                        vals = [sub.loc[sub[mg_x]==c,"Value"].sum() for c in cats]
+                        fig.add_trace(go.Scatterpolar(r=vals+[vals[0]], theta=cats+[cats[0]],
+                            fill="toself", name=str(grp)))
+                    fig.update_layout(polar=dict(radialaxis=dict(visible=True)),
+                        title=f"Radar: {label8}", template=TPL)
+                else:
+                    st.warning("Select a Color group for Radar chart.")
+                    fig = go.Figure()
+            else:  # Parallel Categories
+                pc_cols = [mg_x] + ([mg_col] if color_c else [])
+                fig = px.parallel_categories(df[pc_cols+([mg_val] if mg_val!="Row Count" else [])].dropna().head(2000),
+                    dimensions=pc_cols, template=TPL,
+                    title=f"Parallel Categories: {' → '.join(pc_cols)}")
 
-          if miss_cols:
-              sub = df[miss_cols].isnull().astype(int).sample(min(miss_n, len(df))).reset_index(drop=True)
-              fig = go.Figure(go.Heatmap(
-                  z=sub.T.values,
-                  x=[str(i) for i in sub.index],
-                  y=miss_cols,
-                  colorscale=[[0,"#d1fae5"],[1,"#ef4444"]],
-                  showscale=True,
-                  colorbar=dict(title="", tickvals=[0,1], ticktext=["Present","Missing"]),
-              ))
-              fig.update_layout(title=f"Missing Data (sample {len(sub)} rows)", template=TPL,
-                  height=max(300, len(miss_cols)*24),
-                  margin=dict(t=45,b=20,l=130,r=20),
-                  yaxis=dict(autorange="reversed"))
-              st.plotly_chart(std_layout(fig), use_container_width=True)
+            st.plotly_chart(std_layout(fig, h=480), use_container_width=True)
 
-              st.markdown("**Missing count per column:**")
-              miss_summary = df[miss_cols].isnull().sum().reset_index()
-              miss_summary.columns=["Column","Missing"]
-              miss_summary["%"]=( miss_summary["Missing"]/len(df)*100).round(1)
-              miss_summary = miss_summary.sort_values("Missing",ascending=False)
-              fig2 = px.bar(miss_summary, x="Column", y="Missing", color="%",
-                  color_continuous_scale="Reds", template=TPL,
-                  title="Missing Values per Column", text_auto=True)
-              fig2.update_xaxes(tickangle=-35)
-              st.plotly_chart(std_layout(fig2), use_container_width=True)
+        # ═══════════════════════════════════════════════════════════════
+        # 9️⃣ CUSTOM CHART BUILDER
+        # ═══════════════════════════════════════════════════════════════
+        elif "Custom" in active_section:
+            st.markdown("#### 9️⃣ Custom Chart Builder")
+            st.caption("Full control — pick any columns and any chart type.")
+            cu1,cu2,cu3 = st.columns(3)
+            with cu1:
+                cu_x     = st.selectbox("X axis", ["None"]+all_cols, key="cu_x")
+                cu_y     = st.selectbox("Y axis", ["None"]+all_cols, key="cu_y")
+                cu_color = st.selectbox("Color", ["None"]+all_cols, key="cu_color")
+                cu_size  = st.selectbox("Size", ["None"]+num_cols, key="cu_size")
+            with cu2:
+                cu_facet = st.selectbox("Facet column", ["None"]+cat_cols, key="cu_facet")
+                cu_facr  = st.selectbox("Facet row", ["None"]+cat_cols, key="cu_facr")
+                cu_type  = st.selectbox("Chart type", [
+                    "Bar","Horizontal Bar","Line","Area","Scatter","Bubble",
+                    "Box","Violin","Strip","Histogram","Pie","Donut",
+                    "Treemap","Sunburst","Funnel","ECDF","Density Heatmap",
+                    "Parallel Coordinates","Parallel Categories","Scatter Matrix"
+                ], key="cu_type")
+            with cu3:
+                cu_agg   = st.selectbox("Aggregate Y by X?", ["None","Sum","Mean","Count","Median","Max","Min"], key="cu_agg")
+                cu_pal   = st.selectbox("Color palette", PALETTES+["Plotly","D3","G10","T10"], key="cu_pal")
+                cu_n     = st.slider("Sample rows", 100, len(df), min(2000, len(df)), 100, key="cu_n")
+                cu_h     = st.slider("Chart height", 300, 900, 450, 50, key="cu_h")
+                cu_tl    = st.selectbox("Trendline", ["None","OLS","Lowess"], key="cu_tl")
 
-      # ═══════════════════════════════════════════════════════════════
-      # 1️⃣1️⃣ PAIR PLOT
-      # ═══════════════════════════════════════════════════════════════
-      elif "Pair" in active_section:
-          st.markdown("#### 1️⃣1️⃣ Pair Plot")
-          pp1,pp2 = st.columns(2)
-          with pp1:
-              pair_cols = st.multiselect("Columns (2–8)", num_cols,
-                  default=num_cols[:min(4,len(num_cols))], key="pair_cols2")
-              pair_color = st.selectbox("Color by", ["None"]+cat_cols, key="pair_color2")
-          with pp2:
-              pair_n    = st.slider("Sample rows", 100, 2000, 500, key="pair_n")
-              pair_diag = st.selectbox("Diagonal", ["histogram","box","violin"], key="pair_diag")
+            plot_df2 = df.sample(cu_n)
+            x_c = cu_x if cu_x != "None" else None
+            y_c = cu_y if cu_y != "None" else None
+            color_c2 = cu_color if cu_color != "None" else None
+            size_c   = cu_size if cu_size != "None" else None
+            facet_c  = cu_facet if cu_facet != "None" else None
+            facr_c   = cu_facr if cu_facr != "None" else None
 
-          if len(pair_cols) >= 2:
-              pair_df = df[pair_cols+([pair_color] if pair_color!="None" else [])].dropna().sample(min(pair_n,len(df)))
-              kw_p = dict(data_frame=pair_df, dimensions=pair_cols, template=TPL,
-                  title="Pair Plot", opacity=0.55)
-              if pair_color != "None":
-                  kw_p["color"] = pair_color
-                  kw_p["color_discrete_sequence"] = COLORS
-              fig = px.scatter_matrix(**kw_p)
-              fig.update_traces(diagonal_visible=(pair_diag=="histogram"),
-                  marker=dict(size=3))
-              fig.update_layout(height=650, margin=dict(t=45,b=20,l=20,r=20))
-              st.plotly_chart(fig, use_container_width=True)
-          else:
-              st.info("Select at least 2 numeric columns.")
+            # Pre-aggregate if requested
+            if cu_agg != "None" and x_c and y_c:
+                agg_fn5 = {"Sum":"sum","Mean":"mean","Count":"count","Median":"median","Max":"max","Min":"min"}
+                plot_df2 = (df.groupby(df[x_c].fillna("(blank)").astype(str))[y_c]
+                    .agg(agg_fn5[cu_agg]).round(2).reset_index())
+                plot_df2.columns = [x_c, y_c]
+
+            pal_map = {p: getattr(px.colors.sequential, p, COLORS) for p in PALETTES}
+            pal_map.update({"Plotly":px.colors.qualitative.Plotly,"D3":px.colors.qualitative.D3,
+                            "G10":px.colors.qualitative.G10,"T10":px.colors.qualitative.T10})
+            disc_pal = pal_map.get(cu_pal, COLORS)
+            tl_arg = {"OLS":"ols","Lowess":"lowess","None":None}[cu_tl]
+
+            try:
+                kw2 = dict(data_frame=plot_df2, template=TPL,
+                    title=f"{cu_type}: {y_c or ''} by {x_c or ''}")
+                if x_c: kw2["x"] = x_c
+                if y_c: kw2["y"] = y_c
+                if color_c2: kw2["color"] = color_c2
+                if facet_c: kw2["facet_col"] = facet_c; kw2["facet_col_wrap"] = 3
+                if facr_c: kw2["facet_row"] = facr_c
+
+                if cu_type == "Bar":
+                    fig = px.bar(**kw2, color_discrete_sequence=disc_pal, text_auto=True)
+                    if x_c: fig.update_xaxes(tickangle=-35)
+                elif cu_type == "Horizontal Bar":
+                    if x_c and y_c:
+                        kw2["x"], kw2["y"] = y_c, x_c
+                    fig = px.bar(**kw2, orientation="h", color_discrete_sequence=disc_pal)
+                elif cu_type == "Line":
+                    fig = px.line(**kw2, color_discrete_sequence=disc_pal)
+                elif cu_type == "Area":
+                    fig = px.area(**kw2, color_discrete_sequence=disc_pal)
+                elif cu_type in ("Scatter","Bubble"):
+                    if tl_arg: kw2["trendline"] = tl_arg
+                    if size_c and cu_type=="Bubble": kw2["size"]=size_c; kw2["size_max"]=25
+                    fig = px.scatter(**kw2, color_discrete_sequence=disc_pal, opacity=0.7)
+                elif cu_type == "Box":
+                    fig = px.box(**kw2, color_discrete_sequence=disc_pal, points="outliers")
+                elif cu_type == "Violin":
+                    fig = px.violin(**kw2, color_discrete_sequence=disc_pal, box=True)
+                elif cu_type == "Strip":
+                    fig = px.strip(**kw2, color_discrete_sequence=disc_pal)
+                elif cu_type == "Histogram":
+                    fig = px.histogram(**kw2, color_discrete_sequence=disc_pal, nbins=40, marginal="rug")
+                elif cu_type in ("Pie","Donut"):
+                    fig = px.pie(plot_df2, names=x_c, values=y_c, hole=0.4 if cu_type=="Donut" else 0,
+                        color_discrete_sequence=disc_pal, title=kw2["title"])
+                elif cu_type == "Treemap":
+                    path = [p for p in [x_c, color_c2] if p]
+                    fig = px.treemap(plot_df2, path=path, values=y_c,
+                        color_continuous_scale=cu_pal, title=kw2["title"])
+                elif cu_type == "Sunburst":
+                    path = [p for p in [x_c, color_c2] if p]
+                    fig = px.sunburst(plot_df2, path=path, values=y_c,
+                        color_discrete_sequence=disc_pal, title=kw2["title"])
+                elif cu_type == "Funnel":
+                    fig = px.funnel(**kw2, color_discrete_sequence=disc_pal)
+                elif cu_type == "ECDF":
+                    fig = px.ecdf(**kw2, color_discrete_sequence=disc_pal)
+                elif cu_type == "Density Heatmap":
+                    fig = px.density_heatmap(plot_df2, x=x_c, y=y_c,
+                        nbinsx=30, nbinsy=30, color_continuous_scale=cu_pal, title=kw2["title"])
+                elif cu_type == "Parallel Coordinates":
+                    pc_num = [c for c in [x_c,y_c,size_c] if c and pd.api.types.is_numeric_dtype(df[c])]
+                    if len(pc_num) >= 2:
+                        fig = px.parallel_coordinates(plot_df2, dimensions=pc_num,
+                            color=pc_num[0], color_continuous_scale=cu_pal, title=kw2["title"])
+                    else:
+                        st.warning("Parallel Coordinates needs numeric columns for X, Y.")
+                        fig = go.Figure()
+                elif cu_type == "Parallel Categories":
+                    pc_c = [c for c in [x_c, color_c2] if c]
+                    fig = px.parallel_categories(plot_df2, dimensions=pc_c, title=kw2["title"])
+                elif cu_type == "Scatter Matrix":
+                    sm_cols = [c for c in [x_c,y_c,size_c] if c]
+                    if len(sm_cols) < 2: sm_cols = num_cols[:4]
+                    fig = px.scatter_matrix(plot_df2, dimensions=sm_cols, color=color_c2,
+                        color_discrete_sequence=disc_pal, title=kw2["title"], opacity=0.6)
+                    fig.update_traces(diagonal_visible=False, marker=dict(size=3))
+                else:
+                    fig = go.Figure()
+
+                st.plotly_chart(std_layout(fig, h=cu_h), use_container_width=True)
+            except Exception as e:
+                st.error(f"Chart error: {e}")
+
+        # ═══════════════════════════════════════════════════════════════
+        # 🔟 MISSING DATA MAP
+        # ═══════════════════════════════════════════════════════════════
+        elif "Missing" in active_section:
+            st.markdown("#### 🔟 Missing Data Map")
+            miss_cols = st.multiselect("Columns to inspect", all_cols, default=all_cols, key="miss_cols")
+            miss_n    = st.slider("Sample rows", 50, 500, 100, key="miss_n")
+
+            if miss_cols:
+                sub = df[miss_cols].isnull().astype(int).sample(min(miss_n, len(df))).reset_index(drop=True)
+                fig = go.Figure(go.Heatmap(
+                    z=sub.T.values,
+                    x=[str(i) for i in sub.index],
+                    y=miss_cols,
+                    colorscale=[[0,"#d1fae5"],[1,"#ef4444"]],
+                    showscale=True,
+                    colorbar=dict(title="", tickvals=[0,1], ticktext=["Present","Missing"]),
+                ))
+                fig.update_layout(title=f"Missing Data (sample {len(sub)} rows)", template=TPL,
+                    height=max(300, len(miss_cols)*24),
+                    margin=dict(t=45,b=20,l=130,r=20),
+                    yaxis=dict(autorange="reversed"))
+                st.plotly_chart(std_layout(fig), use_container_width=True)
+
+                st.markdown("**Missing count per column:**")
+                miss_summary = df[miss_cols].isnull().sum().reset_index()
+                miss_summary.columns=["Column","Missing"]
+                miss_summary["%"]=( miss_summary["Missing"]/len(df)*100).round(1)
+                miss_summary = miss_summary.sort_values("Missing",ascending=False)
+                fig2 = px.bar(miss_summary, x="Column", y="Missing", color="%",
+                    color_continuous_scale="Reds", template=TPL,
+                    title="Missing Values per Column", text_auto=True)
+                fig2.update_xaxes(tickangle=-35)
+                st.plotly_chart(std_layout(fig2), use_container_width=True)
+
+        # ═══════════════════════════════════════════════════════════════
+        # 1️⃣1️⃣ PAIR PLOT
+        # ═══════════════════════════════════════════════════════════════
+        elif "Pair" in active_section:
+            st.markdown("#### 1️⃣1️⃣ Pair Plot")
+            pp1,pp2 = st.columns(2)
+            with pp1:
+                pair_cols = st.multiselect("Columns (2–8)", num_cols,
+                    default=num_cols[:min(4,len(num_cols))], key="pair_cols2")
+                pair_color = st.selectbox("Color by", ["None"]+cat_cols, key="pair_color2")
+            with pp2:
+                pair_n    = st.slider("Sample rows", 100, 2000, 500, key="pair_n")
+                pair_diag = st.selectbox("Diagonal", ["histogram","box","violin"], key="pair_diag")
+
+            if len(pair_cols) >= 2:
+                pair_df = df[pair_cols+([pair_color] if pair_color!="None" else [])].dropna().sample(min(pair_n,len(df)))
+                kw_p = dict(data_frame=pair_df, dimensions=pair_cols, template=TPL,
+                    title="Pair Plot", opacity=0.55)
+                if pair_color != "None":
+                    kw_p["color"] = pair_color
+                    kw_p["color_discrete_sequence"] = COLORS
+                fig = px.scatter_matrix(**kw_p)
+                fig.update_traces(diagonal_visible=(pair_diag=="histogram"),
+                    marker=dict(size=3))
+                fig.update_layout(height=650, margin=dict(t=45,b=20,l=20,r=20))
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Select at least 2 numeric columns.")
